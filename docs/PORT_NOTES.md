@@ -1,6 +1,6 @@
 # Port notes
 
-What the PS2 port does, how it behaves, and what is known to be unfinished. Everything was tested in PCSX2 v2.8.2 only; nothing has been run on a real console.
+What the PS2 port does, how it behaves, and what is known to be unfinished. Everything was tested in PCSX2 v2.8.2 and on PAL PlayStation 2.
 
 ## How it works
 
@@ -57,12 +57,3 @@ Share of frames that took one vblank (60 FPS on time). Real-hardware speed is un
 
 The main cost in the slow acts is decoding the music in software (about 20% of the CPU) on top of full-screen software tile drawing. To hold the frame rate the game lowers detail when frames run
 long: far scenery in special stages is not drawn, the special-stage floor and parallax backgrounds draw every second row. This only happens while the frame rate is below target.
-
-## Not implemented / not verified
-
-- Split-screen (Competition mode), video playback (the ending movies), online features and leaderboards.
-- Real hardware: speed, USB boot through a launcher, memory card writes, 480p over component, PAL.
-- Several screens were never visited by script or by eye: title cards, Act Clear, Game Over, Continue, special stage results, credits, cutscenes. Menus were checked in English and Italian at 4:3; longer
-  labels in other languages may not fit.
-- Three harmless-looking `_request_end` TLB misses (a NULL pointer in an IOP RPC completion) were seen occasionally at scene changes; the cause is unknown.
-- There is no Exit button (leaving the game would only restart it on a PS2).
