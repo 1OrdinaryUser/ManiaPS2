@@ -2,7 +2,7 @@
 
 ## boot.txt
 
-A text file named `boot.txt` next to the ELF is read at start (one line, options separated by `;` or spaces). It is for testing and is never needed to play. On a disc image the same file is `BOOT.TXT` in the root: `tools\make_iso.ps1 ... -BootTxt boot.txt` puts it there (the normal build adds none).
+A text file named `boot.txt` next to the ELF is read at start (one line, options separated by `;` or spaces). It is for testing and is never needed to play. On a disc image the same file is `BOOT.TXT` in the root: `tools\make_iso.ps1 ... -BootTxt boot.txt` puts it there (the normal build adds none)
 
 | Option | Effect |
 |---|---|
