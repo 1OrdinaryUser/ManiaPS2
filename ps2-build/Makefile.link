@@ -1,0 +1,14 @@
+EE_BIN = p2_engine.elf
+EE_OBJS = $(wildcard obj/*.o)
+EE_INCS += -I$(PS2DEV)/gsKit/include
+EE_LDFLAGS += -L$(PS2DEV)/gsKit/lib -Wl,-Map,p2_engine.map -Wl,--wrap=_read
+EE_LIBS = -lgskit -ldmakit -lpad -laudsrv -lmc -lfileXio -lpatches -ldebug -lstdc++ -lm -lc -lkernel
+EE_CFLAGS += -O2
+
+all: $(EE_BIN)
+
+clean:
+	rm -f $(EE_BIN)
+
+include $(PS2SDK)/samples/Makefile.pref
+include $(PS2SDK)/samples/Makefile.eeglobal

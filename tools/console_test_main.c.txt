@@ -1,0 +1,149 @@
+/*
+ * Sonic Mania PS2 - console bring-up test.
+ *
+ * A tiny program for finding out, on a real PlayStation 2, which of the things the game relies on work, without any game data:
+ *   1. a text screen (libdebug, the one every homebrew uses) with the console's region, ROM version and memory figures
+ *   2. memory: the largest heap the program can grow, and a write/read test over a 12 MB static array (the game has about that much static data)
+ *   3. colour-bar test patterns in the three video modes the game could use, each for about 6 seconds, announced on the text screen first:
+ *        PAL 576i (50 Hz)   NTSC 480i (60 Hz, what the game uses)   480p progressive (component cables only)
+ *   4. a summary screen
+ * Nothing is written anywhere. Press nothing; it runs by itself and ends in the summary.
+ */
+#include <kernel.h>
+#include <debug.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <tamtypes.h>
+#include <sifrpc.h>
+#include <dmaKit.h>
+#include <gsKit.h>
+
+#define TEST_BUILD __DATE__ " " __TIME__
+
+static unsigned char s_bigArray[12 * 1024 * 1024]; /* in .bss, like the game's static data */
+
+static void wait_ms(int ms) { usleep(ms * 1000); }
+
+static void text_screen(void)
+{
+    init_scr();
+    scr_setbgcolor(0x500000);
+    scr_setfontcolor(0xFFFFFF);
+    scr_clear();
+    scr_setXY(0, 0);
+    scr_printf("\n\n\n");
+}
+
+/* Draws colour bars in the given GS mode for the given time. Returns 0 on success. */
+static int bars(int gsMode, int interlaced, int width, int height, int ms, const char *name)
+{
+    GSGLOBAL *gs = gsKit_init_global_custom(64 * 1024, 16 * 1024);
+    if (!gs)
+        return -1;
+    static int dmaReady;
+    if (!dmaReady) {
+        dmaKit_init(D_CTRL_RELE_OFF, D_CTRL_MFD_OFF, D_CTRL_STS_UNSPEC, D_CTRL_STD_OFF, D_CTRL_RCYC_8, 1 << DMA_CHANNEL_GIF);
+        dmaKit_chan_init(DMA_CHANNEL_GIF);
+        dmaReady = 1;
+    }
+    gs->Mode = gsMode;
+    gs->Interlace = interlaced ? GS_INTERLACED : GS_NONINTERLACED;
+    gs->Field = interlaced ? GS_FIELD : GS_FRAME;
+    gs->Width = width;
+    gs->Height = height;
+    gs->PSM = GS_PSM_CT16;
+    gs->PSMZ = GS_PSMZ_16S;
+    gs->DoubleBuffering = GS_SETTING_ON;
+    gs->ZBuffering = GS_SETTING_OFF;
+    gs->PrimAlphaEnable = GS_SETTING_OFF;
+    gsKit_init_screen(gs);
+    gsKit_mode_switch(gs, GS_ONESHOT);
+
+    static const u8 col[8][3] = { { 255, 255, 255 }, { 255, 255, 0 }, { 0, 255, 255 }, { 0, 255, 0 }, { 255, 0, 255 }, { 255, 0, 0 }, { 0, 0, 255 }, { 80, 80, 80 } };
+    const int frames = ms / 17;
+    for (int f = 0; f < frames; ++f) {
+        gsKit_clear(gs, GS_SETREG_RGBAQ(0x20, 0x20, 0x20, 0x80, 0x00));
+        const float bw = (float)width / 8.0f;
+        for (int i = 0; i < 8; ++i)
+            gsKit_prim_sprite(gs, bw * i, (float)height * 0.15f, bw * (i + 1), (float)height * 0.85f, 1, GS_SETREG_RGBAQ(col[i][0] / 2, col[i][1] / 2, col[i][2] / 2, 0x80, 0x00));
+        /* border box: shows how much the TV cuts off */
+        const u64 white = GS_SETREG_RGBAQ(0x80, 0x80, 0x80, 0x80, 0x00);
+        gsKit_prim_sprite(gs, 0, 0, (float)width, 4, 1, white);
+        gsKit_prim_sprite(gs, 0, (float)height - 4, (float)width, (float)height, 1, white);
+        gsKit_prim_sprite(gs, 0, 0, 4, (float)height, 1, white);
+        gsKit_prim_sprite(gs, (float)width - 4, 0, (float)width, (float)height, 1, white);
+        /* a moving square: proves that frames are really being shown */
+        const float x = (float)((f * 6) % (width - 40));
+        gsKit_prim_sprite(gs, x, (float)height * 0.88f, x + 40, (float)height * 0.88f + 24, 1, white);
+        gsKit_queue_exec(gs);
+        gsKit_sync_flip(gs);
+    }
+    gsKit_deinit_global(gs);
+    (void)name;
+    return 0;
+}
+
+int main(void)
+{
+    SifInitRpc(0);
+    text_screen();
+    scr_printf("   Sonic Mania PS2 - console test   (built %s)\n", TEST_BUILD);
+    scr_printf("   If you can read this, the program started and the text screen works.\n\n");
+
+    /* region and ROM version: the byte at 0x1FC7FF52 is the region letter libdebug uses to pick PAL or NTSC */
+    const char region = *(volatile char *)0x1FC7FF52;
+    scr_printf("   console region letter: '%c'  (E = Europe/PAL, A = America, J = Japan)\n", region >= 32 && region < 127 ? region : '?');
+    scr_printf("   video standard the text screen uses: %s\n", region == 'E' ? "PAL" : "NTSC");
+    scr_printf("   gsKit signal detection: %s\n", gsKit_detect_signal() == GS_MODE_PAL ? "PAL" : "NTSC");
+
+    /* memory */
+    extern char _end[];
+    char *start = (char *)sbrk(0);
+    long grown = 0;
+    while (sbrk(65536) != (void *)-1)
+        grown += 65536;
+    sbrk(-grown);
+    scr_printf("   program end 0x%08x, heap can grow %ld KB (the game wants 20000+ KB)\n", (unsigned)_end, grown / 1024);
+    (void)start;
+
+    unsigned bad = 0;
+    for (unsigned i = 0; i < sizeof(s_bigArray); ++i) s_bigArray[i] = (unsigned char)(i * 7 + 3);
+    for (unsigned i = 0; i < sizeof(s_bigArray); ++i) bad += s_bigArray[i] != (unsigned char)(i * 7 + 3);
+    scr_printf("   12 MB static array write/read test: %s\n\n", bad ? "FAILED" : "ok");
+
+    scr_printf("   Next: colour bars in three video modes, 6 seconds each.\n");
+    scr_printf("   Please note which ones you can see (and whether the white frame is complete).\n");
+    scr_printf("   1) PAL 576i   2) NTSC 480i   3) 480p progressive\n");
+    wait_ms(7000);
+
+    text_screen();
+    scr_printf("   Test 1 of 3: PAL 576i bars follow now (6 s)...\n");
+    wait_ms(2500);
+    const int r1 = bars(GS_MODE_PAL, 1, 640, 512, 6000, "PAL");
+
+    text_screen();
+    scr_printf("   Test 1 (PAL 576i) done, result code %d.\n   Test 2 of 3: NTSC 480i bars follow now (6 s)...\n", r1);
+    wait_ms(2500);
+    const int r2 = bars(GS_MODE_NTSC, 1, 640, 448, 6000, "NTSC");
+
+    text_screen();
+    scr_printf("   Test 2 (NTSC 480i) done, result code %d.\n   Test 3 of 3: 480p bars follow now (6 s, component cables only)...\n", r2);
+    wait_ms(2500);
+    const int r3 = bars(GS_MODE_DTV_480P, 0, 704, 480, 6000, "480p");
+
+    text_screen();
+    scr_printf("   Console test finished (built %s).\n\n", TEST_BUILD);
+    scr_printf("   Please tell what you saw:\n");
+    scr_printf("     - this text screen:                     yes (you are reading it)\n");
+    scr_printf("     - PAL 576i colour bars:                 ?\n");
+    scr_printf("     - NTSC 480i colour bars:                ?\n");
+    scr_printf("     - 480p colour bars:                     ?\n");
+    scr_printf("   (result codes %d %d %d, 0 = the console accepted the mode)\n", r1, r2, r3);
+    scr_printf("   Memory: heap %ld KB, static array %s.\n", grown / 1024, bad ? "FAILED" : "ok");
+    for (;;) {
+        wait_ms(1000);
+    }
+    return 0;
+}

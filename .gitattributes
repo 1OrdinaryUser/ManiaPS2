@@ -1,0 +1,7 @@
+# The build scripts run inside a Linux container: keep them LF even when checked out on Windows.
+*.sh      text eol=lf
+*.patch   text eol=lf
+Dockerfile text eol=lf
+*.link    text eol=lf
+*.bat     text eol=crlf
+*.ps1     text eol=crlf

@@ -1,0 +1,33 @@
+# Your own game data and everything built from it must never be committed.
+/input/*
+!/input/README.txt
+/output/
+/work/
+
+# Game data, builds and media of any kind
+*.rsdk
+*.elf
+*.iso
+*.img
+*.bin
+*.irx
+*.gif
+*.png
+*.jpg
+*.jpeg
+*.wav
+*.ogg
+*.mp4
+*.ogv
+*.exe
+*.dll
+*.o
+*.map
+
+# Saves, settings and logs produced by running the game
+Settings.ini
+SaveData.bin
+Achievements.bin
+log.txt
+emulog.txt
+boot.txt

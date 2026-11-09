@@ -1,0 +1,3 @@
+# SHA-256 of Data.rsdk files this port has been tested with. A file not listed here still builds, with a warning.
+# Format: <sha256> <description>. Hashes of files are facts about files; the files themselves are not, and must not be, in this repository.
+E73F52197B61EE821285CAE3137658A45004D499553CB6484996F10FD5FEA308  Sonic Mania Plus, Steam PC release (208,401,799 bytes) - tested

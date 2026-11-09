@@ -1,0 +1,1763 @@
+diff --git a/SonicMania/Game.c b/SonicMania/Game.c
+index 7b8a2a84..199329f0 100644
+--- a/SonicMania/Game.c
++++ b/SonicMania/Game.c
+@@ -18,6 +18,16 @@ const char *modID = "SonicMania";
+ 
+ int32 RSDKRevision = RETRO_REVISION;
+ 
++#if MANIA_USE_PLUS && defined(PS2_REPLAY_INTS)
++// The engine's GameConfig loader (RetroEngine.cpp, PS2 branch) remaps globals slots assuming the replay buffers start at int32 slot
++// 67037 and are 0x40000 ints in the stock layout. Verify that against the real struct so a layout change breaks the build instead of
++// silently corrupting memory.
++#include <stddef.h>
++_Static_assert(offsetof(GlobalVariables, replayWriteBuffer) == 67037 * sizeof(int32), "PS2: replay buffer base slot changed, update PS2_REPLAY_BASE_SLOT");
++_Static_assert(offsetof(GlobalVariables, replayTableID) == (67037 + 4 * PS2_REPLAY_INTS) * sizeof(int32),
++               "PS2: field after the replay buffers is not where the GameConfig slot remap expects it");
++#endif
++
+ RSDKSceneInfo *SceneInfo = NULL;
+ 
+ RSDKGameInfo *GameInfo = NULL;
+diff --git a/SonicMania/GameLink.h b/SonicMania/GameLink.h
+index 9a263de9..60b18dae 100644
+--- a/SonicMania/GameLink.h
++++ b/SonicMania/GameLink.h
+@@ -65,7 +65,12 @@ typedef uint32 color;
+ // 0x800 scene objects, 0x40 reserved ones, and 0x100 spare slots for creation
+ #define RESERVE_ENTITY_COUNT (0x40)
+ #define TEMPENTITY_COUNT     (0x100)
+-#define SCENEENTITY_COUNT    (0x800)
++// PS2 port: must match RSDK/Scene/Object.hpp. Pass the same -DPS2_SCENEENTITY_COUNT=<n> to the engine and the game build.
++#ifdef PS2_SCENEENTITY_COUNT
++#define SCENEENTITY_COUNT (PS2_SCENEENTITY_COUNT)
++#else
++#define SCENEENTITY_COUNT (0x800)
++#endif
+ #define ENTITY_COUNT         (RESERVE_ENTITY_COUNT + SCENEENTITY_COUNT + TEMPENTITY_COUNT)
+ #define TEMPENTITY_START     (ENTITY_COUNT - TEMPENTITY_COUNT)
+ 
+diff --git a/SonicMania/GameVariables.h b/SonicMania/GameVariables.h
+index 94749179..45083c75 100644
+--- a/SonicMania/GameVariables.h
++++ b/SonicMania/GameVariables.h
+@@ -188,6 +188,9 @@ typedef enum {
+ typedef enum {
+     SECRET_RICKYMODE = 1 << 0,
+     SECRET_SUPERDASH = 1 << 1,
++#ifdef PS2_PORT
++    SECRET_PS2DEVMODE = 1 << 8, // PS2 port: developer mode (entered from the Credits, see CreditsSetup.c), shows the developer entry in the Sound Test
++#endif
+ } GameCheats;
+ #endif
+ 
+@@ -249,10 +252,16 @@ typedef struct {
+     int32 initCoolBonus;
+     int32 coolBonus[4];
+ #if MANIA_USE_PLUS
+-    int32 replayWriteBuffer[0x40000];
+-    int32 replayReadBuffer[0x40000];
+-    int32 replayTempWBuffer[0x40000];
+-    int32 replayTempRBuffer[0x40000];
++    // PS2 port: these four buffers are 1MB each in the stock game (4MB of the 4.4MB globals block). Build with
++    // -DPS2_REPLAY_INTS=<n> to size them smaller; the engine's GameConfig loader remaps slot offsets to match (RetroEngine.cpp),
++    // and REPLAY_MAX_FRAMECOUNT is derived from this size. The buffers keep their stock start slot, so earlier fields do not move.
++#ifndef PS2_REPLAY_INTS
++#define PS2_REPLAY_INTS 0x40000
++#endif
++    int32 replayWriteBuffer[PS2_REPLAY_INTS];
++    int32 replayReadBuffer[PS2_REPLAY_INTS];
++    int32 replayTempWBuffer[PS2_REPLAY_INTS];
++    int32 replayTempRBuffer[PS2_REPLAY_INTS];
+     int32 replayTableID;
+     int32 replayTableLoaded;
+     int32 taTableID;
+diff --git a/SonicMania/Objects/Credits/CreditsSetup.c b/SonicMania/Objects/Credits/CreditsSetup.c
+index fa098d27..4c3b9655 100644
+--- a/SonicMania/Objects/Credits/CreditsSetup.c
++++ b/SonicMania/Objects/Credits/CreditsSetup.c
+@@ -25,7 +25,16 @@ void CreditsSetup_StaticUpdate(void)
+             if (!RSDK.ChannelActive(0))
+                 Music_PlayTrack(++CreditsSetup->creditsTrack);
+ 
+-            if (ControllerInfo->keyStart.press || (CreditsSetup->creditsSize && CreditsSetup->creditsPos >= CreditsSetup->creditsSize)) {
++#ifdef PS2_PORT
++            // Developer code (see CreditsSetup_PS2DevCode): when complete, Cross + Start leaves the credits for the Sound Test instead of the menu
++            const bool32 ps2OpenSoundTest = CreditsSetup_PS2DevCode();
++            if (ps2OpenSoundTest)
++                CreditsSetup->openSoundTest = true;
++#else
++            const bool32 ps2OpenSoundTest = false;
++#endif
++            if (ps2OpenSoundTest || ControllerInfo->keyStart.press
++                || (CreditsSetup->creditsSize && CreditsSetup->creditsPos >= CreditsSetup->creditsSize)) {
+                 CreditsSetup->skipped = true;
+ 
+                 fade->state    = FXFade_State_FadeOut;
+@@ -41,6 +50,18 @@ void CreditsSetup_StaticUpdate(void)
+             if (fade->state == FXFade_State_Wait && fade->wait == 1) {
+                 EntityMenuParam *param = MenuParam_GetParam();
+ 
++#ifdef PS2_PORT
++                if (CreditsSetup->openSoundTest) {
++                    // Developer mode: go to the Sound Test (the D.A. Garden scene) the way the Extras menu does, and remember that it was unlocked
++                    globals->secrets |= SECRET_PS2DEVMODE;
++                    TimeAttackData_Clear();
++                    strcpy(param->menuTag, "Extras");
++                    param->menuSelection       = EXTRAS_SELECTION_DAGARDEN;
++                    param->creditsReturnToMenu = true;
++                    RSDK.SetScene("Extras", API.CheckDLC(DLC_PLUS) ? "D.A. Garden Plus" : "D.A. Garden");
++                }
++                else
++#endif
+ #if MANIA_USE_PLUS
+                 if (param->creditsReturnToMenu) {
+                     RSDK.SetScene("Presentation", "Menu");
+@@ -94,9 +115,54 @@ void CreditsSetup_Draw(void) {}
+ 
+ void CreditsSetup_Create(void *data) {}
+ 
++#ifdef PS2_PORT
++// Developer code on the Credits: up, up, down, down, left, right, left, right (d-pad or left stick), then Cross + Start (in either order).
++// Returns true on the frame the whole combination is completed. A Start press before that skips the credits as usual.
++bool32 CreditsSetup_PS2DevCode(void)
++{
++    static const int8 code[8] = { 0, 0, 1, 1, 2, 3, 2, 3 }; // 0 up, 1 down, 2 left, 3 right
++
++    int32 pressed = -1;
++    if (ControllerInfo->keyUp.press || AnalogStickInfoL->keyUp.press)
++        pressed = 0;
++    else if (ControllerInfo->keyDown.press || AnalogStickInfoL->keyDown.press)
++        pressed = 1;
++    else if (ControllerInfo->keyLeft.press || AnalogStickInfoL->keyLeft.press)
++        pressed = 2;
++    else if (ControllerInfo->keyRight.press || AnalogStickInfoL->keyRight.press)
++        pressed = 3;
++
++    if (pressed >= 0 && !CreditsSetup->devArmed) {
++        if (pressed == code[CreditsSetup->devStep])
++            ++CreditsSetup->devStep;
++        else
++            CreditsSetup->devStep = pressed == code[0] ? 1 : 0;
++
++        if (CreditsSetup->devStep >= 8) {
++            CreditsSetup->devArmed = true;
++            RSDK.PlaySfx(CreditsSetup->sfxDevCode, false, 255);
++        }
++    }
++
++    if (CreditsSetup->devArmed
++        && ((ControllerInfo->keyStart.press && ControllerInfo->keyA.down) || (ControllerInfo->keyA.press && ControllerInfo->keyStart.down))) {
++        RSDK.PlaySfx(CreditsSetup->sfxDevCode, false, 255);
++        return true;
++    }
++
++    return false;
++}
++#endif
++
+ void CreditsSetup_StageLoad(void)
+ {
+     CreditsSetup->started = false;
++#ifdef PS2_PORT
++    CreditsSetup->devStep       = 0;
++    CreditsSetup->devArmed      = false;
++    CreditsSetup->openSoundTest = false;
++    CreditsSetup->sfxDevCode    = RSDK.GetSfx("Global/MenuAccept.wav");
++#endif
+ 
+     foreach_all(FXFade, fxFade) { CreditsSetup->fxFade = fxFade; }
+ }
+diff --git a/SonicMania/Objects/Credits/CreditsSetup.h b/SonicMania/Objects/Credits/CreditsSetup.h
+index 21751369..dad24b67 100644
+--- a/SonicMania/Objects/Credits/CreditsSetup.h
++++ b/SonicMania/Objects/Credits/CreditsSetup.h
+@@ -14,6 +14,13 @@ struct ObjectCreditsSetup {
+     int32 scrollPos;
+     int32 creditsPos;
+     int32 creditsSize;
++#ifdef PS2_PORT
++    // developer mode code (PS2 port): up up down down left right left right, then Cross + Start opens the Sound Test
++    int32 devStep;
++    bool32 devArmed;
++    bool32 openSoundTest;
++    uint16 sfxDevCode;
++#endif
+ };
+ 
+ // Entity Class
+@@ -39,5 +46,8 @@ void CreditsSetup_Serialize(void);
+ 
+ // Extra Entity Functions
+ void CreditsSetup_LoadCreditsStrings(void);
++#ifdef PS2_PORT
++bool32 CreditsSetup_PS2DevCode(void);
++#endif
+ 
+ #endif //! OBJ_CREDITSSETUP_H
+diff --git a/SonicMania/Objects/Global/APICallback.c b/SonicMania/Objects/Global/APICallback.c
+index da8d1edb..b9d60580 100644
+--- a/SonicMania/Objects/Global/APICallback.c
++++ b/SonicMania/Objects/Global/APICallback.c
+@@ -852,6 +852,14 @@ bool32 APICallback_CheckUnreadNotifs(void)
+ 
+ bool32 APICallback_NotifyAutosave(void)
+ {
++#ifdef PS2_PORT
++    {
++        // developer flag (boot.txt "menu=..."): act as if the autosave notice was already acknowledged, so the menu under test is not covered
++        extern const char *ps2_open_menu(void);
++        if (ps2_open_menu())
++            globals->notifiedAutosave = true;
++    }
++#endif
+     if (globals->notifiedAutosave) {
+         if (!APICallback->isAutoSaving && !APICallback->activeEntity)
+             return false;
+diff --git a/SonicMania/Objects/Global/DialogRunner.c b/SonicMania/Objects/Global/DialogRunner.c
+index c4338ecf..01a00858 100644
+--- a/SonicMania/Objects/Global/DialogRunner.c
++++ b/SonicMania/Objects/Global/DialogRunner.c
+@@ -264,6 +264,14 @@ bool32 DialogRunner_CheckUnreadNotifs(void)
+ }
+ bool32 DialogRunner_NotifyAutosave(void)
+ {
++#ifdef PS2_PORT
++    {
++        // developer flag (boot.txt "menu=..."): act as if the autosave notice was already acknowledged
++        extern const char *ps2_open_menu(void);
++        if (ps2_open_menu())
++            globals->notifiedAutosave = true;
++    }
++#endif
+     if (globals->notifiedAutosave) {
+         if (!DialogRunner->isAutoSaving && !DialogRunner->activeCallback)
+             return false;
+diff --git a/SonicMania/Objects/Global/Music.c b/SonicMania/Objects/Global/Music.c
+index 1df79af9..0d14671e 100644
+--- a/SonicMania/Objects/Global/Music.c
++++ b/SonicMania/Objects/Global/Music.c
+@@ -35,6 +35,12 @@ void Music_Create(void *data)
+                 char trackName[0x20];
+                 RSDK.GetCString(trackName, &self->trackFile);
+                 Music_SetMusicTrack(trackName, self->trackID, self->trackLoop);
++#ifdef PS2_PORT
++        {
++            extern void ps2_stream_register(const char *file, int prio);
++            ps2_stream_register(trackName, 2); // this level's own track: preloaded first
++        }
++#endif
+ 
+                 if (self->playOnLoad)
+                     self->state = Music_State_PlayOnLoad;
+@@ -102,6 +108,11 @@ void Music_SetMusicTrack(const char *path, uint8 track, uint32 loopPoint)
+     }
+     Music->trackNames[track][charID] = 0;
+     Music->trackLoops[track]         = loopPoint;
++#ifdef PS2_PORT
++    // the engine reads the level's music files into memory before the level is shown (DATA STREAM option); the standard tracks have priority 1
++    extern void ps2_stream_register(const char *file, int prio);
++    ps2_stream_register(path, 1);
++#endif
+ }
+ 
+ void Music_Stop(void) { RSDK.StopChannel(Music->channelID); }
+diff --git a/SonicMania/Objects/Global/Player.c b/SonicMania/Objects/Global/Player.c
+index d1581860..f83c1957 100644
+--- a/SonicMania/Objects/Global/Player.c
++++ b/SonicMania/Objects/Global/Player.c
+@@ -695,6 +695,10 @@ void Player_StageLoad(void)
+         globals->playerID = RSDK.CheckSceneFolder("MSZCutscene") ? ID_KNUCKLES : ID_DEFAULT_PLAYER;
+ 
+     SceneInfo->debugMode = globals->medalMods & MEDAL_DEBUGMODE;
++#ifdef PS2_DEBUGMODE
++    // Developer build only (PS2_DEBUGMODE=1 sh build_game.sh): enables the game's free-fly debug mode (Square toggles it) for auditing objects.
++    SceneInfo->debugMode = true;
++#endif
+ #if MANIA_USE_PLUS
+     RSDK.AddViewableVariable("Debug Mode", &SceneInfo->debugMode, VIEWVAR_BOOL, false, true);
+ #endif
+diff --git a/SonicMania/Objects/Global/ReplayRecorder.h b/SonicMania/Objects/Global/ReplayRecorder.h
+index 9f7507b7..cf6d1c14 100644
+--- a/SonicMania/Objects/Global/ReplayRecorder.h
++++ b/SonicMania/Objects/Global/ReplayRecorder.h
+@@ -10,7 +10,10 @@
+ // but as far as I can tell, this one is just random numbers?
+ #define REPLAY_SIGNATURE (0xF6057BED)
+ 
+-#define REPLAY_MAX_FRAMECOUNT (37447)
++// Frames that fit in one replay buffer (header + frames + 4 bytes padding == buffer size). Stock: 0x40000 ints -> 37447 frames.
++// PS2_REPLAY_INTS (GameVariables.h) shrinks the buffers; the limit follows so the recorder's bounds checks stay correct.
++// Evaluated where used (after ReplayHeader/ReplayFrame are defined).
++#define REPLAY_MAX_FRAMECOUNT ((int32)((PS2_REPLAY_INTS * 4 - sizeof(ReplayHeader) - 4) / sizeof(ReplayFrame)))
+ 
+ typedef struct {
+     uint32 signature;
+diff --git a/SonicMania/Objects/Global/Zone.c b/SonicMania/Objects/Global/Zone.c
+index af250542..cc622935 100644
+--- a/SonicMania/Objects/Global/Zone.c
++++ b/SonicMania/Objects/Global/Zone.c
+@@ -77,6 +77,51 @@ void Zone_LateUpdate(void)
+ 
+ void Zone_StaticUpdate(void)
+ {
++#ifdef PS2_WARP_HOOK
++    // Developer build only (boot.txt "warp=Class"): teleport Player 1 and the camera to the target the engine published, then re-apply the
++    // BoundsMarkers for that part of the level so the death boundary/camera bounds match the new position. See PS2Warp in the engine.
++    {
++        extern int ps2_warp_poll(int32 * x, int32 * y);
++        int32 warpX, warpY;
++        static int32 warpTrace = 0;
++        if (warpTrace > 0) {
++            extern void ps2_log(const char *fmt, ...);
++            EntityPlayer *tp = RSDK_GET_ENTITY(SLOT_PLAYER1, Player);
++            ps2_log("[warp-game] t=%d pos=%d,%d vel=%d,%d deathType=%d death=%d camB=%d\n", 40 - warpTrace, (int)(tp->position.x >> 16),
++                    (int)(tp->position.y >> 16), (int)(tp->velocity.x >> 8), (int)(tp->velocity.y >> 8), (int)tp->deathType,
++                    (int)(Zone->deathBoundary[0] >> 16), (int)Zone->cameraBoundsB[0]);
++            --warpTrace;
++        }
++        if (ps2_warp_poll(&warpX, &warpY)) {
++            warpTrace = 40;
++            EntityPlayer *warpPlayer = RSDK_GET_ENTITY(SLOT_PLAYER1, Player);
++            warpPlayer->position.x   = warpX;
++            warpPlayer->position.y   = warpY;
++            warpPlayer->velocity.x   = 0;
++            warpPlayer->velocity.y   = 0;
++            warpPlayer->groundVel    = 0;
++            BoundsMarker_ApplyAllBounds(warpPlayer, true);
++            // The destination can lie outside the bounds the level start sets up (markers do not always cover it), so open the bottom
++            // bound wide enough to contain it; the boss/arena objects set their own bounds once they trigger.
++            if ((warpY >> 16) + 64 > Zone->cameraBoundsB[0]) {
++                Zone->cameraBoundsB[0] = (warpY >> 16) + 400;
++                Zone->playerBoundsB[0] = Zone->cameraBoundsB[0] << 16;
++                Zone->deathBoundary[0] = Zone->cameraBoundsB[0] << 16;
++                if (warpPlayer->camera)
++                    warpPlayer->camera->boundsB = Zone->cameraBoundsB[0];
++            }
++            {
++                extern void ps2_log(const char *fmt, ...);
++                ps2_log("[warp-game] applied: death=%d camB=%d playerB=%d camT=%d\n", (int)(Zone->deathBoundary[0] >> 16), (int)Zone->cameraBoundsB[0],
++                        (int)(Zone->playerBoundsB[0] >> 16), (int)Zone->cameraBoundsT[0]);
++            }
++            if (warpPlayer->camera) {
++                warpPlayer->camera->position.x = warpX;
++                warpPlayer->camera->position.y = warpY;
++            }
++        }
++    }
++#endif
+     // Global timer, used to keep various objects in sync
+     // This timer is reset every time a stage is loaded
+     ++Zone->timer;
+diff --git a/SonicMania/Objects/Menu/DASetup.c b/SonicMania/Objects/Menu/DASetup.c
+index 91e7e2a4..9ae9994b 100644
+--- a/SonicMania/Objects/Menu/DASetup.c
++++ b/SonicMania/Objects/Menu/DASetup.c
+@@ -13,8 +13,83 @@ void DASetup_Update(void) {}
+ 
+ void DASetup_LateUpdate(void) {}
+ 
++#ifdef PS2_PORT
++// Number of selectable entries: the tracks, plus the developer entry when developer mode is on.
++#define DASETUP_ENTRIES() (DASetup->trackCount + (DASetup->devMode ? 1 : 0))
++
++// Shows a line of text in the track title label.
++static void DASetup_PS2ShowText(const char *text)
++{
++    String str;
++    INIT_STRING(str);
++    RSDK.SetString(&str, (char *)text);
++    UIInfoLabel_SetString(DASetup->trackTitleLabel, &str);
++}
++
++#if MANIA_USE_PLUS
++static void DASetup_PS2DevSaveCB(bool32 success)
++#else
++static void DASetup_PS2DevSaveCB(void)
++#endif
++{
++#if MANIA_USE_PLUS
++    DASetup_PS2ShowText(success ? "FULL SAVE WRITTEN" : "SAVE FAILED");
++    if (!success)
++        RSDK.PlaySfx(UIWidgets->sfxFail, false, 255);
++#else
++    DASetup_PS2ShowText("FULL SAVE WRITTEN");
++#endif
++}
++
++// The developer entry: makes the save file a 100% save and unlocks everything.
++//  - game progress: every zone cleared, all 7 emeralds, all 32 special stage medals gold, the good ending seen, so every unlock
++//    (Time Attack, Competition, Peel Out, Insta-Shield, & Knuckles, Debug Mode, Mean Bean Machine, D.A. Garden, Blue Spheres) is on
++//  - one finished Mania Mode save slot (the first blank one; slots that hold a game are never touched), all emeralds
++// then the save file is written to the chosen save device.
++void DASetup_PS2DevAction(void)
++{
++    if (SceneInfo->inEditor || API_GetNoSave() || globals->saveLoaded != STATUS_OK) {
++        DASetup_PS2ShowText("NO SAVE FILE LOADED");
++        RSDK.PlaySfx(UIWidgets->sfxFail, false, 255);
++        return;
++    }
++
++    GameProgress_UnlockAll();
++    ProgressRAM *progress       = GameProgress_GetProgressRAM();
++    progress->allZonesCleared   = true;
++    progress->allSpecialCleared = true;
++    for (int32 e = 0; e < GAMEPROGRESS_EMERALD_COUNT; ++e) progress->specialCleared[e] = true;
++    for (int32 i = 0; i < GAMEPROGRESS_UNLOCK_COUNT; ++i) progress->unreadNotifs[i] = true; // already "read": no unlock pop-ups
++
++    for (int32 s = 0; s < 8; ++s) {
++#if MANIA_USE_PLUS
++        SaveRAM *slot = (SaveRAM *)SaveGame_GetDataPtr(s, false);
++#else
++        SaveRAM *slot = (SaveRAM *)SaveGame_GetDataPtr(s);
++#endif
++        if (slot->saveState == SAVEGAME_BLANK) {
++            memset(slot, 0, 0x400); // one slot is 0x100 ints
++            slot->saveState         = SAVEGAME_COMPLETE;
++            slot->characterID       = 0; // Sonic & Tails
++            slot->zoneID            = ZONE_ERZ;
++            slot->lives             = 3;
++            slot->score1UP          = 50000;
++            slot->collectedEmeralds = 0x7F;
++            break;
++        }
++    }
++
++    RSDK.PlaySfx(DASetup->sfxEmerald, false, 255);
++    DASetup_PS2ShowText("WRITING SAVE");
++    SaveGame_SaveFile(DASetup_PS2DevSaveCB);
++}
++#endif
++
+ void DASetup_StaticUpdate(void)
+ {
++#ifdef PS2_PORT
++    DASetup->devMode = (globals->secrets & SECRET_PS2DEVMODE) != 0;
++#endif
+     if (!DASetup->initialized) {
+         DASetup_SetupUI();
+         DASetup->initialized = true;
+@@ -78,6 +153,12 @@ void DASetup_DisplayTrack(int32 trackID)
+     String text;
+     INIT_STRING(text);
+ 
++#ifdef PS2_PORT
++    if (DASetup->devMode && trackID == DASetup->trackCount) {
++        DASetup_PS2ShowText("DEVELOPER - FULL SAVE");
++        return;
++    }
++#endif
+     EntityUIInfoLabel *trackTitleLabel = DASetup->trackTitleLabel;
+     EntityMusic *trackCountTrack       = DASetup->trackList[trackID];
+ 
+@@ -156,6 +237,15 @@ void DASetup_SetupUI(void)
+     LogHelpers_PrintString(&buffer);
+ #endif
+     UIInfoLabel_SetString(trackSelLabel, &buffer);
++#ifdef PS2_PORT
++    if (DASetup->devMode) {
++        // developer mode: the label above the track says so; the developer entry comes after the last track (press Left on track 00)
++        String devText;
++        INIT_STRING(devText);
++        RSDK.SetString(&devText, "DEVELOPER MODE");
++        UIInfoLabel_SetString(trackSelLabel, &devText);
++    }
++#endif
+ }
+ 
+ void DASetup_State_ManageControl(void)
+@@ -170,10 +260,20 @@ void DASetup_State_ManageControl(void)
+     else if (UIControl->anyDownPress)
+         DASetup->trackID -= 10;
+ 
++#ifdef PS2_PORT
++    const int32 entries = DASETUP_ENTRIES();
++    if (DASetup->trackID < 0)
++        DASetup->trackID += entries;
++    if (DASetup->trackID >= entries)
++        DASetup->trackID -= entries;
++    if (DASetup->trackID < 0 || DASetup->trackID >= entries) // moves of 10 on a short list
++        DASetup->trackID = 0;
++#else
+     if (DASetup->trackID < 0)
+         DASetup->trackID += DASetup->trackCount;
+     if (DASetup->trackID >= DASetup->trackCount)
+         DASetup->trackID -= DASetup->trackCount;
++#endif
+ 
+     if (prevTrack != DASetup->trackID) {
+         RSDK.PlaySfx(UIWidgets->sfxBleep, false, 255);
+@@ -181,6 +281,12 @@ void DASetup_State_ManageControl(void)
+     }
+ 
+     if (UIControl->anyConfirmPress) {
++#ifdef PS2_PORT
++        if (DASetup->devMode && DASetup->trackID == DASetup->trackCount) {
++            DASetup_PS2DevAction();
++        }
++        else
++#endif
+         if (DASetup->activeTrack == DASetup->trackID) {
+             Music_Stop();
+             DASetup->activeTrack = TRACK_NONE;
+diff --git a/SonicMania/Objects/Menu/DASetup.h b/SonicMania/Objects/Menu/DASetup.h
+index 29bf8f14..ed2acdda 100644
+--- a/SonicMania/Objects/Menu/DASetup.h
++++ b/SonicMania/Objects/Menu/DASetup.h
+@@ -20,6 +20,9 @@ struct ObjectDASetup {
+     uint16 sfxMedal;
+     uint16 sfxSSExit;
+     uint16 sfxScoreTotal;
++#ifdef PS2_PORT
++    bool32 devMode; // developer mode is on (set from the Credits): one extra entry after the last track
++#endif
+ };
+ 
+ // Entity Class
+@@ -48,5 +51,8 @@ void DASetup_DisplayTrack(int32 trackID);
+ bool32 DASetup_HandleMedallionDebug(void);
+ void DASetup_SetupUI(void);
+ void DASetup_State_ManageControl(void);
++#ifdef PS2_PORT
++void DASetup_PS2DevAction(void);
++#endif
+ 
+ #endif //! OBJ_DASETUP_H
+diff --git a/SonicMania/Objects/Menu/MainMenu.c b/SonicMania/Objects/Menu/MainMenu.c
+index 8f9c3906..62c019a0 100644
+--- a/SonicMania/Objects/Menu/MainMenu.c
++++ b/SonicMania/Objects/Menu/MainMenu.c
+@@ -10,6 +10,10 @@
+ #if MANIA_USE_PLUS
+ ObjectMainMenu *MainMenu;
+ 
++#ifdef PS2_PORT
++extern int ps2_open_video(void); // developer flag, see ps2_hal.h
++#endif
++
+ void MainMenu_Update(void) {}
+ 
+ void MainMenu_LateUpdate(void) {}
+@@ -19,11 +23,33 @@ void MainMenu_StaticUpdate(void)
+     EntityUIControl *control = MainMenu->menuControl;
+ 
+     if (control && control->active) {
++#ifdef PS2_PORT
++        {
++            // Developer flag (boot.txt "openvideo"): open Options > Video by itself, a while after the Main Menu has settled.
++            static int32 ps2MenuFrames = 0;
++            static bool32 ps2OpenedVideo = false;
++            if (!ps2OpenedVideo && ps2_open_video() && ++ps2MenuFrames == 240) {
++                ps2OpenedVideo = true;
++                LogHelpers_Print("PS2 dev flag: opening the Video menu");
++                UIControl_MatchMenuTag("Video WIN");
++                return;
++            }
++        }
++#endif
+         EntityUIDiorama *diorama         = MainMenu->diorama;
+         MainMenu->confirmPrompt->visible = ((int32)(control->shifter->shiftOffset.y & 0xFFFF0000)) > -0x700000;
+         EntityUIButton *button           = control->buttons[control->lastButtonID];
+ 
+         if (button) {
++#ifdef PS2_PORT
++            static int32 ps2LastLoggedSlot = -99;
++            if (control->buttonID != ps2LastLoggedSlot) {
++                ps2LastLoggedSlot = control->buttonID;
++                EntityUIButton *live = control->buttons[control->buttonID];
++                LogHelpers_Print("PS2 main menu selection: slot %d (lastButtonID %d) frameID %d disabled %d", control->buttonID, control->lastButtonID,
++                                 live ? live->frameID : -1, live ? live->disabled : -1);
++            }
++#endif
+             switch (button->frameID) {
+                 case 0: diorama->dioramaID = UIDIORAMA_MANIAMODE; break;
+                 case 1: diorama->dioramaID = UIDIORAMA_TIMEATTACK; break;
+@@ -167,6 +193,10 @@ void MainMenu_MenuButton_ActionCB(void)
+ {
+     RSDK_THIS(UIButton);
+ 
++#ifdef PS2_PORT
++    LogHelpers_Print("PS2 main menu action: frameID %d", self->frameID); // 0 Mania, 1 Encore, 2 Time Attack, 3 Competition(Plus: 3=Options)... see button frames
++#endif
++
+     switch (self->frameID) {
+         case 0: // Mania Mode
+             if (API_GetNoSave()) {
+@@ -289,7 +319,11 @@ void MainMenu_SetupActions(void)
+     {
+         if (button->listID == 1) {
+             if (button->frameID == 7) {
+-                if (sku_platform != PLATFORM_PC && sku_platform != PLATFORM_DEV) {
++                bool32 removeExit = sku_platform != PLATFORM_PC && sku_platform != PLATFORM_DEV;
++#if defined(PS2_PORT) && !defined(PS2_KEEP_EXIT)
++                removeExit = true; // exiting only restarts the game on the PS2, so there is no Exit button
++#endif
++                if (removeExit) {
+                     EntityUIControl *control = MainMenu->menuControl;
+ 
+                     // Remove "Exit" Button if not on PC or DEV platform
+diff --git a/SonicMania/Objects/Menu/OptionsMenu.c b/SonicMania/Objects/Menu/OptionsMenu.c
+index cc1d8e7d..473558bf 100644
+--- a/SonicMania/Objects/Menu/OptionsMenu.c
++++ b/SonicMania/Objects/Menu/OptionsMenu.c
+@@ -14,7 +14,12 @@ void OptionsMenu_Update(void) {}
+ 
+ void OptionsMenu_LateUpdate(void) {}
+ 
++#ifdef PS2_PORT
++void OptionsMenu_PS2UpdateVideoRows(void);
++void OptionsMenu_StaticUpdate(void) { OptionsMenu_PS2UpdateVideoRows(); }
++#else
+ void OptionsMenu_StaticUpdate(void) {}
++#endif
+ 
+ void OptionsMenu_Draw(void) {}
+ 
+@@ -225,6 +230,10 @@ void OptionsMenu_SetupActions(void)
+     videoControl_Win->yPressCB     = OptionsMenu_VideoControl_Win_YPressCB;
+     videoControl_Win->backPressCB  = OptionsMenu_VideoControl_Win_BackPressCB;
+ 
++#ifdef PS2_PORT
++    OptionsMenu_PS2SetupVideoMenu();
++#endif
++
+     if (sku_platform == PLATFORM_SWITCH || sku_platform == PLATFORM_DEV) {
+         optionsControl->yPressCB = OptionsMenu_ShowManual;
+     }
+@@ -261,6 +270,39 @@ void OptionsMenu_HandleMenuReturn(void)
+ }
+ void OptionsMenu_InitVideoOptionsMenu(void)
+ {
++#ifdef PS2_PORT
++    {
++        // PS2: the video menu has Filter + 4 toggles whose engine settings are stored in the repurposed PC fields:
++        //   Letterbox = border, Resolution(480p) = !windowed ("fullscreen"), Scan mode(progressive) = vsync, Aspect(16:9) = tripleBuffering
++        EntityUIControl *control = OptionsMenu->videoControl_Windows;
++        for (int32 i = 0; i < control->buttonCount; ++i) {
++            EntityUIButton *button = control->buttons[i];
++            if (!button || button->listID != 17)
++                continue;
++
++            // the Save Device row (a repurposed UIResPicker row) has the same label frame as Resolution but is not a Resolution toggle
++            EntityUIButton *firstChoice = UIButton_GetChoicePtr(button, 0);
++            if (firstChoice && firstChoice->classID == UIResPicker->classID)
++                continue;
++            if (firstChoice && UIWinSize && firstChoice->classID == UIWinSize->classID)
++                continue; // the Data Stream row (repurposed Screen Dimensions picker)
++
++            int32 want = -1;
++            switch (button->frameID) {
++                case 2: want = RSDK.GetVideoSetting(VIDEOSETTING_SHADERID) ? 1 : 0; break; // Clean / Filtered (an old saved value of 2 or 3 counts as Filtered)
++                case 13: want = RSDK.GetVideoSetting(VIDEOSETTING_BORDERED) ? 1 : 0; break;
++                case 14: want = RSDK.GetVideoSetting(VIDEOSETTING_WINDOWED) ? 0 : 1; break;
++                case 15: want = RSDK.GetVideoSetting(VIDEOSETTING_VSYNC) ? 1 : 0; break;
++                case 16: want = RSDK.GetVideoSetting(VIDEOSETTING_TRIPLEBUFFERED) ? 1 : 0; break;
++                default: break;
++            }
++
++            if (want >= 0 && button->selection != want)
++                UIButton_SetChoiceSelection(button, want);
++        }
++        return;
++    }
++#endif
+     if (sku_platform == PLATFORM_PC || sku_platform == PLATFORM_DEV) {
+         EntityUIControl *videoControl_Win = OptionsMenu->videoControl_Windows;
+         OptionsRAM *optionsRAM            = Options_GetOptionsRAM();
+@@ -304,6 +346,9 @@ void OptionsMenu_VideoControl_Win_MenuUpdateCB(void) { OptionsMenu_InitVideoOpti
+ 
+ void OptionsMenu_VideoControl_Win_YPressCB(void)
+ {
++#ifdef PS2_PORT
++    return; // settings apply immediately, nothing to confirm
++#endif
+     String message;
+     INIT_STRING(message);
+ 
+@@ -334,6 +379,13 @@ void OptionsMenu_DlgRunnerCB_RevertVideoChanges(void)
+ 
+ bool32 OptionsMenu_VideoControl_Win_BackPressCB(void)
+ {
++#ifdef PS2_PORT
++    // Video settings apply immediately on the PS2, so there is no "keep these settings?" dialog. Just save and go back.
++    RSDK.SetVideoSetting(VIDEOSETTING_CHANGED, false);
++    Options->changed = true;
++    UITransition_StartTransition(UIControl_ReturnToParentMenu, 0);
++    return false;
++#endif
+     String message;
+     INIT_STRING(message);
+ 
+@@ -879,4 +931,286 @@ void OptionsMenu_EditorLoad(void) {}
+ #endif
+ 
+ void OptionsMenu_Serialize(void) {}
++#ifdef PS2_PORT
++// ---------------------------------------------------------------------------------------------------------------------------------------
++// PS2 video menu
++// The PC "Video WIN" menu has Filter, Screen Dimensions (UIWinSize), Border, Fullscreen, Fullscreen Resolution (UIResPicker), Vsync and
++// Triple Buffering. On the PS2 Screen Dimensions, Fullscreen Resolution and the window options make no sense, so:
++//   - Screen Dimensions and Fullscreen Resolution are removed from the list,
++//   - Border     -> Letterbox        (OFF / ON)
++//   - Fullscreen -> Resolution       (240P / 480P)
++//   - Vsync      -> Scan mode        (INTERLACED / PROGRESSIVE)
++//   - Triple buf -> Aspect ratio     (4:3 / 16:9)
++// The two-choice toggles keep their original callbacks (they store into the same engine fields); only their labels change, drawn with the
++// UI font by OptionsMenu_PS2DrawLabel (called from UIButton_Draw / UIChoice_Draw). The PS2 render device reads the fields every frame.
++// ---------------------------------------------------------------------------------------------------------------------------------------
++static const char *ps2VideoTitles[4]     = { "LETTERBOX", "RESOLUTION", "SCAN MODE", "ASPECT RATIO" };
++static const char *ps2VideoChoices[4][2] = { { "OFF", "ON" }, { "240P", "480P" }, { "INTERLACED", "PROGRESSIVE" }, { "4:3", "16:9" } };
++// The Filter row keeps its stock heading art but only has two settings: Clean (nearest neighbour) and Filtered (bilinear). Its other two stock
++// choices are disabled. Label index 12 + choice.
++static const char *ps2FilterChoices[2] = { "CLEAN", "FILTERED" };
++#define PS2_FILTER_FRAMEID 2
++#define PS2_FILTER_LABEL   12
++// The last row is the stock "Fullscreen Resolution" picker (UIResPicker), repurposed to choose where saves are stored (see UIResPicker.c).
++// Its title is drawn as text; its value text is drawn by the picker itself.
++#define PS2_SAVE_TITLE_LABEL 14
++// The stock "Screen Dimensions" picker (UIWinSize) is repurposed as DATA STREAM (AUTO / ON / OFF, see UIWinSize.c); listed just above Save Device.
++#define PS2_STREAM_TITLE_LABEL 15
++// Semantics (see the notes in ps2_hal.c):
++//   Resolution  240P / 480P. 240P shows the game pixel perfect (320x240 for 4:3, 424x240 for 16:9) in the middle of a 480p frame, black around it.
++//               At 240P the Letterbox and Scan mode rows are hidden: they do not apply.
++//   Scan mode   (480P only) INTERLACED = 480i, PROGRESSIVE = 480p (component / D-terminal).
++//   Aspect      4:3 renders 320x240; 16:9 renders 424x240. At 480P the picture fills the frame (anamorphic for 16:9).
++//   Letterbox   (480P only, 16:9 only) ON shows it at its true shape with bars (for a 4:3 TV), OFF fills the frame (for a widescreen TV).
++
++static void OptionsMenu_PS2HideButton(EntityUIButton *button)
++{
++    for (int32 c = 0; c < button->choiceCount; ++c) {
++        EntityUIButton *choice = UIButton_GetChoicePtr(button, c);
++        if (choice) {
++            choice->visible = false;
++            choice->active  = ACTIVE_NEVER;
++        }
++    }
++    button->visible   = false;
++    button->invisible = true;
++    button->active    = ACTIVE_NEVER;
++}
++
++static void OptionsMenu_PS2ShiftButton(EntityUIButton *button, int32 dy)
++{
++    if (!dy)
++        return;
++
++    for (int32 c = 0; c < button->choiceCount; ++c) {
++        EntityUIButton *choice = UIButton_GetChoicePtr(button, c);
++        if (choice)
++            choice->position.y += dy;
++    }
++    button->position.y += dy;
++    button->firstChoicePos.y += dy;
++}
++
++static void OptionsMenu_PS2ShowRow(EntityUIButton *button, bool32 show);
++
++void OptionsMenu_PS2SetupVideoMenu(void)
++{
++    if (OptionsMenu->ps2VideoMenuReady)
++        return;
++    OptionsMenu->ps2VideoMenuReady = true;
++    LogHelpers_Print("PS2 video menu: setting up rows");
++
++    EntityUIControl *control = OptionsMenu->videoControl_Windows;
++    if (!control)
++        return;
++
++    int32 slotY[UICONTROL_BUTTON_COUNT];
++    EntityUIButton *keep[UICONTROL_BUTTON_COUNT];
++    EntityUIButton *saveRow   = NULL;
++    EntityUIButton *streamRow = NULL;
++    int32 kept  = 0;
++    int32 total = control->buttonCount;
++
++    for (int32 i = 0; i < total; ++i)
++        slotY[i] = control->buttons[i]->position.y;
++    for (int32 i = 0; i < total && i < UICONTROL_BUTTON_COUNT; ++i) OptionsMenu->ps2SlotY[i] = slotY[i];
++    OptionsMenu->ps2RowsHiddenState = -1;
++
++    for (int32 i = 0; i < total; ++i) {
++        EntityUIButton *button = control->buttons[i];
++        EntityUIButton *first  = UIButton_GetChoicePtr(button, 0);
++
++        if (first && first->classID == UIWinSize->classID)
++            streamRow = button; // kept (DATA STREAM), listed second to last (below)
++        else if (first && first->classID == UIResPicker->classID)
++            saveRow = button; // kept, but listed last (below)
++        else
++            keep[kept++] = button;
++    }
++    if (streamRow)
++        keep[kept++] = streamRow;
++    if (saveRow) {
++        OptionsMenu_PS2ShowRow(saveRow, true); // the stock Fullscreen Resolution row is placed invisible in the scene
++        keep[kept++] = saveRow;
++    }
++
++    // close the gaps left by the removed entries
++    for (int32 i = 0; i < kept; ++i) {
++        OptionsMenu_PS2ShiftButton(keep[i], slotY[i] - keep[i]->position.y);
++        control->buttons[i] = keep[i];
++    }
++    for (int32 i = kept; i < total; ++i) control->buttons[i] = NULL;
++
++    for (int32 i = 0; i < kept && i < 64; ++i) OptionsMenu->ps2Rows[i] = control->buttons[i];
++    OptionsMenu->ps2RowCount = kept < 64 ? kept : 64;
++
++    // Filter row: only Clean and Filtered exist here, so the stock row's remaining choices are disabled (the scroll code skips disabled choices)
++    for (int32 i = 0; i < kept; ++i) {
++        EntityUIButton *button = control->buttons[i];
++        if (button && button->listID == 17 && button->frameID == PS2_FILTER_FRAMEID) {
++            for (int32 c = 2; c < button->choiceCount; ++c) {
++                EntityUIButton *choice = UIButton_GetChoicePtr(button, c);
++                if (choice)
++                    choice->disabled = true;
++            }
++        }
++    }
++
++    // the "Apply" (Y) prompt does nothing here: settings apply immediately
++    for (int32 p = 0; p < control->promptCount; ++p) {
++        EntityUIButtonPrompt *prompt = control->prompts[p];
++        if (prompt && prompt->buttonID == UIBUTTONPROMPT_BUTTON_Y) {
++            prompt->visible = false;
++            prompt->active  = ACTIVE_NEVER;
++        }
++    }
++
++    if (control->rowCount == total)
++        control->rowCount = kept;
++    control->buttonCount = kept;
++    if (control->buttonID >= kept)
++        control->buttonID = kept - 1;
++    if (control->startingID >= kept)
++        control->startingID = 0;
++}
++
++// 240P is a real 240-line 15 kHz picture (non-interlaced, any cable), so there is no Scan mode. That row is taken out of the control's button list (the cursor moves by list position and does not skip hidden or
++// disabled rows) and hidden, and the rows below move up. Applied whenever Resolution changes.
++static void OptionsMenu_PS2ShowRow(EntityUIButton *button, bool32 show)
++{
++    for (int32 c = 0; c < button->choiceCount; ++c) {
++        EntityUIButton *choice = UIButton_GetChoicePtr(button, c);
++        if (choice) {
++            choice->visible = show;
++            choice->active  = ACTIVE_NEVER; // as created; the selected choice is activated when its row is entered
++        }
++    }
++    button->visible   = show;
++    button->invisible = !show;
++    button->active    = show ? ACTIVE_BOUNDS : ACTIVE_NEVER;
++}
++
++void OptionsMenu_PS2UpdateVideoRows(void)
++{
++    if (!OptionsMenu || !OptionsMenu->ps2VideoMenuReady || !OptionsMenu->videoControl_Windows)
++        return;
++
++    const int32 hide = RSDK.GetVideoSetting(VIDEOSETTING_WINDOWED) ? 1 : 0; // windowed = 240P on the PS2
++    if (hide == OptionsMenu->ps2RowsHiddenState)
++        return;
++    OptionsMenu->ps2RowsHiddenState = hide;
++
++    EntityUIControl *control      = OptionsMenu->videoControl_Windows;
++    EntityUIButton *selectedButton = (control->buttonID >= 0 && control->buttonID < control->buttonCount) ? control->buttons[control->buttonID] : NULL;
++    int32 slot                    = 0;
++    int32 newSelected             = -1;
++    for (int32 i = 0; i < OptionsMenu->ps2RowCount; ++i) {
++        EntityUIButton *button = OptionsMenu->ps2Rows[i];
++        const bool32 isLetterbox = button->listID == 17 && button->frameID == 13; // Border row
++        const bool32 isScan      = button->listID == 17 && button->frameID == 15; // Vsync row
++        (void)isLetterbox; // (Letterbox applies at 240P too now that 240P fills its frame)
++        if (isScan) {
++            OptionsMenu_PS2ShowRow(button, !hide);
++            if (hide)
++                continue;
++        }
++        OptionsMenu_PS2ShiftButton(button, OptionsMenu->ps2SlotY[slot] - button->position.y);
++        control->buttons[slot] = button;
++        if (button == selectedButton)
++            newSelected = slot;
++        ++slot;
++    }
++    for (int32 i = slot; i < OptionsMenu->ps2RowCount; ++i) control->buttons[i] = NULL;
++
++    LogHelpers_Print("PS2 video menu: 240P %d, %d rows, cursor on row %d", hide, slot, newSelected);
++    control->buttonCount = slot;
++    control->rowCount    = slot;
++    if (newSelected >= 0)
++        control->buttonID = newSelected;
++    else if (control->buttonID >= slot)
++        control->buttonID = slot - 1;
++    if (control->lastButtonID >= slot)
++        control->lastButtonID = slot - 1;
++}
++static String *OptionsMenu_PS2GetLabel(int32 index)
++{
++    if (!OptionsMenu->ps2LabelsReady) {
++        for (int32 t = 0; t < 4; ++t) {
++            RSDK.InitString(&OptionsMenu->ps2Labels[t], ps2VideoTitles[t], 0);
++            RSDK.SetSpriteString(UIWidgets->fontFrames, 0, &OptionsMenu->ps2Labels[t]);
++            for (int32 c = 0; c < 2; ++c) {
++                String *s = &OptionsMenu->ps2Labels[4 + t * 2 + c];
++                RSDK.InitString(s, ps2VideoChoices[t][c], 0);
++                RSDK.SetSpriteString(UIWidgets->fontFrames, 0, s);
++            }
++        }
++        for (int32 c = 0; c < 2; ++c) {
++            String *s = &OptionsMenu->ps2Labels[PS2_FILTER_LABEL + c];
++            RSDK.InitString(s, ps2FilterChoices[c], 0);
++            RSDK.SetSpriteString(UIWidgets->fontFrames, 0, s);
++        }
++        RSDK.InitString(&OptionsMenu->ps2Labels[PS2_SAVE_TITLE_LABEL], "SAVE DEVICE", 0);
++        RSDK.SetSpriteString(UIWidgets->fontFrames, 0, &OptionsMenu->ps2Labels[PS2_SAVE_TITLE_LABEL]);
++        RSDK.InitString(&OptionsMenu->ps2Labels[PS2_STREAM_TITLE_LABEL], "DATA STREAM", 0);
++        RSDK.SetSpriteString(UIWidgets->fontFrames, 0, &OptionsMenu->ps2Labels[PS2_STREAM_TITLE_LABEL]);
++        RSDK.SetSpriteAnimation(UIWidgets->fontFrames, 0, &OptionsMenu->ps2FontAnimator, true, 0);
++        OptionsMenu->ps2LabelsReady = true;
++    }
++    return &OptionsMenu->ps2Labels[index];
++}
++
++bool32 OptionsMenu_PS2DrawLabel(Entity *entity, Vector2 *drawPos, int32 align)
++{
++    if (!OptionsMenu || !OptionsMenu->videoControl_Windows)
++        return false;
++
++    int32 index = -1;
++    if (entity->classID == UIButton->classID) {
++        EntityUIButton *button = (EntityUIButton *)entity;
++        // the two repurposed picker rows are recognised by their class first (their label frames overlap those of the toggles)
++        EntityUIButton *pickerChoice = (button->listID == 17 && !button->disabled) ? UIButton_GetChoicePtr(button, 0) : NULL;
++        if (pickerChoice && UIResPicker && pickerChoice->classID == UIResPicker->classID)
++            index = PS2_SAVE_TITLE_LABEL; // the repurposed Fullscreen Resolution row: Save Device
++        else if (pickerChoice && UIWinSize && pickerChoice->classID == UIWinSize->classID)
++            index = PS2_STREAM_TITLE_LABEL; // the repurposed Screen Dimensions row: Data Stream
++        else if (button->listID == 17 && button->frameID >= 13 && button->frameID <= 16 && !button->disabled) {
++            index = button->frameID - 13;
++        }
++    }
++    else if (UIChoice && entity->classID == UIChoice->classID) {
++        EntityUIChoice *choice = (EntityUIChoice *)entity;
++        EntityUIButton *parent = (EntityUIButton *)choice->parent;
++        if (parent && parent->classID == UIButton->classID && parent->listID == 17 && parent->frameID >= 13 && parent->frameID <= 16
++            && !parent->disabled) {
++            int32 choiceIndex = RSDK.GetEntitySlot(choice) - (RSDK.GetEntitySlot(parent) - parent->choiceCount);
++            if (choiceIndex >= 0 && choiceIndex < 2)
++                index = 4 + (parent->frameID - 13) * 2 + choiceIndex;
++        }
++        else if (parent && parent->classID == UIButton->classID && parent->listID == 17 && parent->frameID == PS2_FILTER_FRAMEID && !parent->disabled) {
++            // Filter row: Clean / Filtered replace the stock choice art
++            int32 choiceIndex = RSDK.GetEntitySlot(choice) - (RSDK.GetEntitySlot(parent) - parent->choiceCount);
++            if (choiceIndex >= 0 && choiceIndex < 2)
++                index = PS2_FILTER_LABEL + choiceIndex;
++        }
++    }
++
++    if (index < 0)
++        return false;
++
++    String *label = OptionsMenu_PS2GetLabel(index);
++    int32 width   = RSDK.GetStringWidth(UIWidgets->fontFrames, 0, label, 0, label->length, 0);
++
++    Vector2 pos = *drawPos;
++    switch (align) {
++        default:
++        case UIBUTTON_ALIGN_CENTER: pos.x -= TO_FIXED(width) >> 1; break;
++        case UIBUTTON_ALIGN_LEFT: break;
++        case UIBUTTON_ALIGN_RIGHT: pos.x -= TO_FIXED(width); break;
++    }
++    pos.y -= 0x50000; // the label art is centred on the row, the font glyphs hang from their top edge
++
++    RSDK.DrawText(&OptionsMenu->ps2FontAnimator, &pos, label, 0, label->length, 0, 0, NULL, NULL, false);
++    return true;
++}
++#endif
+ #endif
+diff --git a/SonicMania/Objects/Menu/OptionsMenu.h b/SonicMania/Objects/Menu/OptionsMenu.h
+index e42aa068..6c9b815a 100644
+--- a/SonicMania/Objects/Menu/OptionsMenu.h
++++ b/SonicMania/Objects/Menu/OptionsMenu.h
+@@ -25,6 +25,17 @@ struct ObjectOptionsMenu {
+     EntityUIControl *languageControl_Legacy;
+     EntityUIDiorama *diorama;
+     EntityUIInfoLabel *selectDataToEraseLabel;
++#ifdef PS2_PORT
++    // PS2 video menu: label strings drawn with the UI font (the stock label art has no text for these options)
++    String ps2Labels[16]; // 4 titles, 4 x 2 choices, Clean / Filtered for the Filter row, then the Save Device and Data Stream titles
++    bool32 ps2LabelsReady;
++    Animator ps2FontAnimator;
++    bool32 ps2VideoMenuReady;
++    EntityUIButton *ps2Rows[64]; // the video menu's rows in display order (Letterbox and Scan mode included)
++    int32 ps2RowCount;
++    int32 ps2SlotY[64]; // row positions of the full list, to close the gap when Letterbox / Scan mode are hidden at 240P
++    int32 ps2RowsHiddenState;               // -1 = layout not applied yet, 0 = all rows shown, 1 = Letterbox and Scan mode hidden
++#endif
+ };
+ 
+ // Entity Class
+@@ -98,6 +109,11 @@ void OptionsMenu_AreYouSureDlg_YesCB_EraseReplays(void);
+ void OptionsMenu_EraseReplaysCB(bool32 success);
+ void OptionsMenu_EraseReplaysButton_ActionCB(void);
+ void OptionsMenu_EraseAllButton_ActionCB(void);
++#ifdef PS2_PORT
++void OptionsMenu_PS2SetupVideoMenu(void);
++// Draws the PS2 replacement label of a video-menu button/choice with the UI font; returns false if the entity has none.
++bool32 OptionsMenu_PS2DrawLabel(Entity *entity, Vector2 *drawPos, int32 align);
++#endif
+ 
+ #endif
+ 
+diff --git a/SonicMania/Objects/Menu/UIButton.c b/SonicMania/Objects/Menu/UIButton.c
+index 4f660857..0657cedf 100644
+--- a/SonicMania/Objects/Menu/UIButton.c
++++ b/SonicMania/Objects/Menu/UIButton.c
+@@ -89,7 +89,24 @@ void UIButton_Draw(void)
+         if (self->disabled && self->align == UIBUTTON_ALIGN_LEFT)
+             drawPos.x += 0x150000;
+ 
+-        RSDK.DrawSprite(&self->animator, &drawPos, false);
++#ifdef PS2_PORT
++        // 4:3 Main Menu: the buttons are drawn smaller and so is their text (the layout code sets scale to the wanted fraction of 0x200)
++        // The reduced label is area-averaged by the engine (ps2_set_smooth_scale) instead of sampled with nearest neighbour, which made it ragged.
++        extern void ps2_set_smooth_scale(int on);
++        const uint8 ps2OldFX     = self->drawFX;
++        const bool32 ps2Shrunk = self->scale.x > 0 && self->scale.x < 0x200;
++        if (ps2Shrunk) {
++            self->drawFX |= FX_SCALE;
++            ps2_set_smooth_scale(1);
++        }
++        if (!OptionsMenu_PS2DrawLabel((Entity *)self, &drawPos, self->align))
++#endif
++            RSDK.DrawSprite(&self->animator, &drawPos, false);
++#ifdef PS2_PORT
++        if (ps2Shrunk)
++            ps2_set_smooth_scale(0);
++        self->drawFX = ps2OldFX;
++#endif
+     }
+ }
+ 
+diff --git a/SonicMania/Objects/Menu/UIButtonPrompt.c b/SonicMania/Objects/Menu/UIButtonPrompt.c
+index f2a1ef4d..eb9025a1 100644
+--- a/SonicMania/Objects/Menu/UIButtonPrompt.c
++++ b/SonicMania/Objects/Menu/UIButtonPrompt.c
+@@ -9,6 +9,10 @@
+ 
+ ObjectUIButtonPrompt *UIButtonPrompt;
+ 
++#ifdef PS2_PORT
++#define PS2_PROMPT_Y_WIDTH 96 // pixels reserved for the icon and its text at the right edge of the screen
++#endif
++
+ void UIButtonPrompt_Update(void)
+ {
+     RSDK_THIS(UIButtonPrompt);
+@@ -66,6 +70,14 @@ void UIButtonPrompt_LateUpdate(void)
+     RSDK_THIS(UIButtonPrompt);
+ 
+     EntityUIControl *control = (EntityUIControl *)self->parent;
++#ifdef PS2_PORT
++    if (control && ScreenInfo->size.x < WIDE_SCR_XSIZE && self->buttonID == UIBUTTONPROMPT_BUTTON_Y) {
++        // 4:3: the triangle prompt moves to the bottom right corner of the screen, clear of the banner (the control's position is the screen centre)
++        self->position.x = control->position.x + TO_FIXED((ScreenInfo->size.x >> 1) - PS2_PROMPT_Y_WIDTH);
++        self->position.y = control->position.y + TO_FIXED((ScreenInfo->size.y >> 1) - 12);
++        return;
++    }
++#endif
+     if (control && control->heading && self->headingAnchor) {
+         EntityUIHeading *heading = (EntityUIHeading *)control->heading;
+ 
+@@ -74,22 +86,22 @@ void UIButtonPrompt_LateUpdate(void)
+             case UIBUTTONPROMPT_ANCHOR_NONE: break;
+ 
+             case UIBUTTONPROMPT_ANCHOR_TOPLEFT_ROW1:
+-                self->position.x = heading->position.x - TO_FIXED(188);
++                self->position.x = heading->position.x - TO_FIXED(ScreenInfo->size.x >= WIDE_SCR_XSIZE ? 188 : (ScreenInfo->size.x >> 1) - 14);
+                 self->position.y = heading->position.y - TO_FIXED(8);
+                 break;
+ 
+             case UIBUTTONPROMPT_ANCHOR_TOPRIGHT_ROW1:
+-                self->position.x = heading->position.x + TO_FIXED(124);
++                self->position.x = heading->position.x + TO_FIXED(ScreenInfo->size.x >= WIDE_SCR_XSIZE ? 124 : (ScreenInfo->size.x >> 1) - 79);
+                 self->position.y = heading->position.y - TO_FIXED(8);
+                 break;
+ 
+             case UIBUTTONPROMPT_ANCHOR_TOPLEFT_ROW2:
+-                self->position.x = heading->position.x - TO_FIXED(188);
++                self->position.x = heading->position.x - TO_FIXED(ScreenInfo->size.x >= WIDE_SCR_XSIZE ? 188 : (ScreenInfo->size.x >> 1) - 14);
+                 self->position.y = heading->position.y + TO_FIXED(16);
+                 break;
+ 
+             case UIBUTTONPROMPT_ANCHOR_TOPRIGHT_ROW2:
+-                self->position.x = heading->position.x + TO_FIXED(124);
++                self->position.x = heading->position.x + TO_FIXED(ScreenInfo->size.x >= WIDE_SCR_XSIZE ? 124 : (ScreenInfo->size.x >> 1) - 79);
+                 self->position.y = heading->position.y + TO_FIXED(16);
+                 break;
+         }
+@@ -115,6 +127,11 @@ void UIButtonPrompt_Draw(void)
+ {
+     RSDK_THIS(UIButtonPrompt);
+ 
++#ifdef PS2_PORT
++    // 4:3: the Back / Confirm / Delete prompts overlapped the menu banners on every screen, so only the triangle prompt is drawn (see LateUpdate)
++    if (ScreenInfo->size.x < WIDE_SCR_XSIZE && self->buttonID != UIBUTTONPROMPT_BUTTON_Y)
++        return;
++#endif
+     UIButtonPrompt_SetButtonSprites();
+ 
+     RSDK.DrawSprite(&self->decorAnimator, NULL, false);
+diff --git a/SonicMania/Objects/Menu/UIChoice.c b/SonicMania/Objects/Menu/UIChoice.c
+index c0dbff1f..5978fc03 100644
+--- a/SonicMania/Objects/Menu/UIChoice.c
++++ b/SonicMania/Objects/Menu/UIChoice.c
+@@ -112,8 +112,12 @@ void UIChoice_Draw(void)
+         if (self->auxIcon)
+             RSDK.DrawSprite(&self->iconAnimator, &drawPos, false);
+ 
+-        if (!self->noText)
+-            RSDK.DrawSprite(&self->labelAnimator, &drawPos, false);
++        if (!self->noText) {
++#ifdef PS2_PORT
++            if (!OptionsMenu_PS2DrawLabel((Entity *)self, &drawPos, self->align))
++#endif
++                RSDK.DrawSprite(&self->labelAnimator, &drawPos, false);
++        }
+     }
+ }
+ 
+diff --git a/SonicMania/Objects/Menu/UIControl.c b/SonicMania/Objects/Menu/UIControl.c
+index 47361d46..e1d83830 100644
+--- a/SonicMania/Objects/Menu/UIControl.c
++++ b/SonicMania/Objects/Menu/UIControl.c
+@@ -9,10 +9,261 @@
+ 
+ ObjectUIControl *UIControl;
+ 
++#ifdef PS2_PORT
++// ---------------------------------------------------------------------------------------------------------------------------------------
++// 4:3 layout. The menu scenes are laid out for a 424 pixel wide screen; the PS2 port's 4:3 mode renders 320 wide, which cropped the outer
++// 52 pixels on each side (bars and prompts running off the screen). Menus listed in ps2SqueezeTags are re-laid out for the current width:
++// everything in them moves towards the middle of the screen, and their buttons get narrower, by 320 / 424. Applied when a menu becomes active
++// and whenever the aspect setting changes while it is open (the scale it is laid out for is kept in ps2Scale).
++// ---------------------------------------------------------------------------------------------------------------------------------------
++// menus that get the 4:3 layout, and how far their contents move towards the middle (percent of the screen width ratio; 100 = the default 320/424)
++static const struct {
++    const char *tag;
++    int32 percent;
++} ps2SqueezeTags[] = { { "Extras", 100 },    { "Secrets", 100 },     { "Data Options", 165 }, { "Sound", 100 },    { "Video WIN", 100 },
++                       { "Options", 100 },   { "Main Menu", 100 },   { "Controls KB", 100 },  { "Language", 100 }, { "Competition", 100 }, { "Competition Rules", 100 } };
++
++static bool32 UIControl_PS2TagIs(const String *tag, const char *name)
++{
++    int32 n = (int32)strlen(name);
++    if (tag->length != n)
++        return false;
++    for (int32 i = 0; i < n; ++i) {
++        if (tag->chars[i] != (uint16)name[i])
++            return false;
++    }
++    return true;
++}
++
++static int32 UIControl_PS2WantedScale(const EntityUIControl *control)
++{
++    if (ScreenInfo->size.x >= WIDE_SCR_XSIZE)
++        return 0x10000;
++    int32 scale = (ScreenInfo->size.x << 16) / WIDE_SCR_XSIZE;
++    // menus that need more room are squeezed less: the distance from 1.0 shrinks by the menu's percent
++    const int32 percent = ps2SqueezeTags[control->ps2Squeeze - 2].percent;
++    if (!percent)
++        return 0x10000;
++    return 0x10000 - (((0x10000 - scale) * 100) / percent);
++}
++
++static void UIControl_PS2MoveX(int32 *x, int32 cx, int32 from, int32 to) { *x = cx + (int32)(((int64_t)(*x - cx) * to) / from); }
++static void UIControl_PS2Width(int32 *w, int32 from, int32 to) { *w = (int32)(((int64_t)*w * to) / from); }
++
++void UIControl_PS2Layout(EntityUIControl *control)
++{
++    if (!control->ps2Squeeze) {
++        control->ps2Squeeze = 1;
++        for (uint32 i = 0; i < sizeof(ps2SqueezeTags) / sizeof(ps2SqueezeTags[0]); ++i) {
++            if (UIControl_PS2TagIs(&control->tag, ps2SqueezeTags[i].tag))
++                control->ps2Squeeze = 2 + i;
++        }
++    }
++    if (control->ps2Squeeze < 2)
++        return;
++
++    const int32 from = control->ps2Scale ? control->ps2Scale : 0x10000;
++    const int32 to   = UIControl_PS2WantedScale(control);
++    if (from == to)
++        return;
++    control->ps2Scale = to;
++
++    const int32 cx = control->startPos.x;
++    LogHelpers_Print("PS2 4:3 layout: menu scaled %d -> %d (centre %d)", from, to, cx >> 16);
++
++    // Competition: four player cards 83 pixels wide do not fit side by side in 320 pixels, so on 4:3 they form a 2 x 2 grid
++    const bool32 isCompetition = UIControl_PS2TagIs(&control->tag, "Competition") && control->buttonCount >= 4;
++    static Vector2 competitionCards[4];
++    if (isCompetition) {
++        if (from == 0x10000) {
++            for (int32 i = 0; i < 4; ++i) competitionCards[i] = control->buttons[i]->position;
++        }
++        for (int32 i = 0; i < 4; ++i) {
++            EntityUIButton *card = control->buttons[i];
++            if (to == 0x10000) {
++                card->position = competitionCards[i];
++            }
++            else {
++                card->position.x = cx + ((i & 1) ? 0x300000 : -0x300000);
++                card->position.y = competitionCards[0].y + ((i & 2) ? 0x320000 : -0x260000);
++            }
++            card->startPos = card->position;
++        }
++    }
++
++    // Main Menu: the buttons are placed by the control's UIShifter (a diagonal staircase that scrolls with the selection), so on 4:3 the staircase is
++    // rebuilt through the shifter (see below), and the diorama (294 pixels wide, drawn from its position) is moved so that its slanted edge stays clear
++    // of the button text; the part that no longer fits is cropped off the left side of the screen.
++    const bool32 isMain = UIControl_PS2TagIs(&control->tag, "Main Menu") && control->shifter;
++    static int32 mainShifterX, mainDioramaX;
++    // The stock staircase (buttons 152 wide, 36 pixels per step, selected button at screen x 305 / y 177 of a 424x240 screen, scrolling with the
++    // selection) is too big for 320x240. On 4:3 the buttons, their step and their text are drawn at PS2_MAIN_PERCENT of the stock size (the text
++    // through the entity's FX_SCALE, see UIButton_Draw) and the staircase still scrolls with the selection, with the selected button at
++    // PS2_MAIN_X / PS2_MAIN_Y on the screen. The step is 45 degrees like the stock one, so the left ends of the buttons stay on one diagonal for every
++    // selection, parallel to the diorama's slanted edge: the diorama only has to be moved (PS2_MAIN_DIORAMA_DX) to keep a constant gap to the text.
++    // 16:9 keeps the stock numbers and behaviour.
++#define PS2_MAIN_PERCENT    65
++#define PS2_MAIN_X          235
++#define PS2_MAIN_Y          150
++#define PS2_MAIN_STEP       24      // pixels per button, sideways and down (stock 36)
++#define PS2_MAIN_DIORAMA_DX 0xE0000 // 14 pixels to the right of the stock position (the previous 4:3 layout used 28, which let the diorama touch the text)
++    static int32 mainShifterY;
++    static Vector2 mainShift;
++    static int32 mainBtnW[16], mainBtnH[16], mainBtnEdge[16];
++    if (isMain) {
++        if (from == 0x10000) {
++            mainShifterX = control->shifter->startPos.x;
++            mainShifterY = control->shifter->startPos.y;
++            mainShift    = control->shifter->shift;
++            for (int32 i = 0; i < control->buttonCount && i < 16; ++i) {
++                if (!control->buttons[i])
++                    continue;
++                mainBtnW[i]    = control->buttons[i]->size.x;
++                mainBtnH[i]    = control->buttons[i]->size.y;
++                mainBtnEdge[i] = control->buttons[i]->bgEdgeSize;
++            }
++        }
++        const bool32 small = to != 0x10000;
++        control->shifter->shift.x = small ? PS2_MAIN_STEP << 16 : mainShift.x;
++        control->shifter->shift.y = small ? -(PS2_MAIN_STEP << 16) : mainShift.y;
++        for (int32 i = 0; i < control->buttonCount && i < 16; ++i) {
++            EntityUIButton *b = control->buttons[i];
++            if (!b)
++                continue;
++            b->size.x     = small ? (int32)(((int64_t)mainBtnW[i] * PS2_MAIN_PERCENT) / 100) : mainBtnW[i];
++            b->size.y     = small ? (int32)(((int64_t)mainBtnH[i] * PS2_MAIN_PERCENT) / 100) : mainBtnH[i];
++            b->bgEdgeSize = small ? (mainBtnEdge[i] * PS2_MAIN_PERCENT) / 100 : mainBtnEdge[i];
++            b->scale.x = b->scale.y = small ? (0x200 * PS2_MAIN_PERCENT) / 100 : 0;
++        }
++        // the camera is centred on the control, so a screen position maps to the control's start plus its offset from the screen centre
++        control->shifter->startPos.x = small ? control->startPos.x + ((PS2_MAIN_X - (ScreenInfo->size.x >> 1)) << 16) : mainShifterX;
++        control->shifter->startPos.y = small ? control->startPos.y + ((PS2_MAIN_Y - (ScreenInfo->size.y >> 1)) << 16) : mainShifterY;
++        if (UIDiorama) {
++            foreach_all(UIDiorama, dio)
++            {
++                if (UIControl_ContainsPos(control, &dio->position)) {
++                    if (from == 0x10000)
++                        mainDioramaX = dio->position.x;
++                    dio->position.x = mainDioramaX + ((to == 0x10000) ? 0 : PS2_MAIN_DIORAMA_DX);
++                }
++            }
++        }
++        LogHelpers_Print("PS2 4:3 layout: main menu shifter start %d,%d shift %d,%d", control->shifter->startPos.x >> 16, control->shifter->startPos.y >> 16,
++                         control->shifter->shift.x >> 16, control->shifter->shift.y >> 16);
++
++    }
++
++    // Data Options: the two columns of wide labels do not fit next to each other, so on 4:3 the five rows form one column
++    const bool32 isDataOptions = UIControl_PS2TagIs(&control->tag, "Data Options") && control->buttonCount >= 5;
++    static Vector2 dataRows[8];
++    static uint8 dataRowCount, dataColumnCount;
++    if (isDataOptions) {
++        if (from == 0x10000) {
++            for (int32 i = 0; i < control->buttonCount && i < 8; ++i) dataRows[i] = control->buttons[i]->position;
++            dataRowCount    = control->rowCount;
++            dataColumnCount = control->columnCount;
++        }
++        for (int32 i = 0; i < control->buttonCount && i < 8; ++i) {
++            EntityUIButton *row = control->buttons[i];
++            if (to == 0x10000) {
++                row->position = dataRows[i];
++            }
++            else {
++                row->position.x = cx;
++                row->position.y = dataRows[0].y + (i > 4 ? 4 : i) * 0x1E0000; // the sixth button sits on the fifth (the stock layout has them overlap too)
++            }
++            row->startPos = row->position;
++        }
++        control->rowCount    = (to == 0x10000) ? dataRowCount : 5;
++        control->columnCount = (to == 0x10000) ? dataColumnCount : 1;
++    }
++
++    for (int32 i = 0; i < control->buttonCount; ++i) {
++        EntityUIButton *button = control->buttons[i];
++        if (!button)
++            continue;
++        if ((isCompetition && i < 4) || isDataOptions || isMain)
++            continue;
++        UIControl_PS2MoveX(&button->position.x, cx, from, to);
++        UIControl_PS2MoveX(&button->startPos.x, cx, from, to);
++        if (button->classID != UIButton->classID)
++            continue; // sliders, key binders, save slots... have their own fields behind the common base: only their position is moved
++        UIControl_PS2Width(&button->size.x, from, to);
++        UIControl_PS2MoveX(&button->firstChoicePos.x, cx, from, to);
++        for (int32 c = 0; c < button->choiceCount; ++c) {
++            EntityUIButton *choice = UIButton_GetChoicePtr(button, c);
++            if (choice) {
++                UIControl_PS2MoveX(&choice->position.x, cx, from, to);
++                UIControl_PS2MoveX(&choice->startPos.x, cx, from, to);
++                UIControl_PS2Width(&choice->size.x, from, to);
++            }
++        }
++    }
++
++    // loose decoration inside the menu: labels, texts, pictures, panels
++    if (UIInfoLabel) {
++        foreach_all(UIInfoLabel, label)
++        {
++            if (UIControl_ContainsPos(control, &label->position)) {
++                UIControl_PS2MoveX(&label->position.x, cx, from, to);
++                if (to != 0x10000) {
++                    // the text is centred on the label: keep all of it on the screen (e.g. "VOLUME ADJUSTMENT" in the Sound menu)
++                    const int32 half  = (RSDK.GetStringWidth(UIWidgets->fontFrames, 0, &label->text, 0, 0, 0) >> 1) + 8;
++                    int32 limit       = (ScreenInfo->size.x >> 1) - half;
++                    const int32 shift = (label->position.x - cx) >> 16;
++                    if (limit < 0)
++                        limit = 0;
++                    if (shift > limit)
++                        label->position.x = cx + (limit << 16);
++                    else if (shift < -limit)
++                        label->position.x = cx - (limit << 16);
++                }
++            }
++        }
++    }
++    // option panels (Sound, Video, Controls): the blue panel is 424 wide and its lower label is right aligned to that width, so on 4:3 the panel gets the
++    // screen's width and the labels follow its edges
++    if (UIOptionPanel) {
++        foreach_all(UIOptionPanel, panel)
++        {
++            if (UIControl_ContainsPos(control, &panel->position)) {
++                const int32 dx         = (to == 0x10000) ? 0 : ((WIDE_SCR_XSIZE - ScreenInfo->size.x) >> 1) << 16;
++                panel->size.x          = ((to == 0x10000) ? WIDE_SCR_XSIZE : ScreenInfo->size.x) << 16;
++                panel->drawPosTop.x    = panel->position.x - 0x920000 + dx;
++                panel->drawPosBottom.x = panel->position.x + (panel->botAlignRight ? 0xA20000 : -0xA0000) - dx;
++            }
++        }
++    }    if (UIText) {
++        foreach_all(UIText, text)
++        {
++            if (UIControl_ContainsPos(control, &text->position))
++                UIControl_PS2MoveX(&text->position.x, cx, from, to);
++        }
++    }
++    if (UIPicture) {
++        foreach_all(UIPicture, picture)
++        {
++            if (UIControl_ContainsPos(control, &picture->position))
++                UIControl_PS2MoveX(&picture->position.x, cx, from, to);
++        }
++    }
++    if (UIMedallionPanel) {
++        foreach_all(UIMedallionPanel, panel)
++        {
++            if (UIControl_ContainsPos(control, &panel->position))
++                UIControl_PS2MoveX(&panel->position.x, cx, from, to);
++        }
++    }
++}
++#endif
++
+ void UIControl_Update(void)
+ {
+     RSDK_THIS(UIControl);
+ 
++#ifdef PS2_PORT
++    UIControl_PS2Layout(self);
++#endif
+     if (self->buttonID >= 0 && self->buttonID != self->lastButtonID)
+         self->lastButtonID = self->buttonID;
+ 
+@@ -184,10 +435,35 @@ void UIControl_ClearInputs(uint8 buttonID)
+     UIControl->inputLocked = true;
+ }
+ 
++#ifdef PS2_PORT
++extern int ps2_open_video(void); // developer flag, see ps2_hal.h
++extern const char *ps2_open_menu(void);
++#endif
++
+ void UIControl_ProcessInputs(void)
+ {
+     RSDK_THIS(UIControl);
+ 
++#ifdef PS2_PORT
++    {
++        // Developer flag (boot.txt "openvideo"): once the 7-button Main Menu has been active for a while, open Options > Video by itself.
++        static int32 ps2ActiveFrames   = 0;
++        static bool32 ps2OpenedVideo   = false;
++        static int32 ps2DiagCalls = 0;
++        if (ps2_open_menu() && (++ps2DiagCalls % 300) == 1)
++            LogHelpers_Print("PS2 diag: ProcessInputs running, buttonCount %d, button0 frame %d, buttonID %d, activeFrames %d", self->buttonCount,
++                             self->buttons[0] ? self->buttons[0]->frameID : -1, self->buttonID, ps2ActiveFrames);
++        // The PS2 build removes the Exit button, so the running Main Menu has 6 buttons (7 in the scene file).
++        if (!ps2OpenedVideo && ps2_open_menu() && (self->buttonCount == 6 || self->buttonCount == 7) && self->buttons[0]
++            && self->buttons[0]->frameID == 0 && ++ps2ActiveFrames == 400) {
++            ps2OpenedVideo = true;
++            LogHelpers_Print("PS2 dev flag: opening the %s menu", ps2_open_menu());
++            UIControl_MatchMenuTag(ps2_open_menu());
++            return;
++        }
++    }
++#endif
++
+     UIControl_HandlePosition();
+ 
+     if (!UIControl->inputLocked) {
+@@ -425,6 +701,10 @@ void UIControl_SetActiveMenuButtonPrompts(EntityUIControl *entity)
+ 
+ void UIControl_SetActiveMenu(EntityUIControl *entity)
+ {
++#ifdef PS2_PORT
++    LogHelpers_Print("PS2 menu active: buttons %d, selected button %d, first button frame %d", entity->buttonCount, entity->buttonID,
++                     (entity->buttonCount > 0 && entity->buttons[0]) ? entity->buttons[0]->frameID : -1);
++#endif
+ #if MANIA_USE_PLUS
+     LogHelpers_PrintString(&entity->tag);
+ #endif
+@@ -441,6 +721,9 @@ void UIControl_SetActiveMenu(EntityUIControl *entity)
+         entity->buttonID = entity->startingID;
+     }
+ 
++#ifdef PS2_PORT
++    UIControl_PS2Layout(entity);
++#endif
+     RSDK.ClearCameras();
+     RSDK.AddCamera(&entity->position, ScreenInfo->size.x << 16, ScreenInfo->size.y << 16, true);
+ 
+diff --git a/SonicMania/Objects/Menu/UIControl.h b/SonicMania/Objects/Menu/UIControl.h
+index 38b6cd0a..717c2a7d 100644
+--- a/SonicMania/Objects/Menu/UIControl.h
++++ b/SonicMania/Objects/Menu/UIControl.h
+@@ -96,6 +96,10 @@ struct EntityUIControl {
+     void (*menuUpdateCB)(void);
+     void (*yPressCB)(void);
+     void (*xPressCB)(void);
++#ifdef PS2_PORT
++    int32 ps2Scale;   // horizontal layout scale this menu is currently laid out for (16.16, 0 = not touched yet)
++    int32 ps2Squeeze; // 0 = not decided, 1 = no 4:3 layout for this menu, 2 = squeeze it (UIControl_PS2Layout)
++#endif
+     int32 unused2;
+     int32 unused3;
+     int32 unused4;
+@@ -136,6 +140,9 @@ EntityUIControl *UIControl_GetUIControl(void);
+ bool32 UIControl_isMoving(EntityUIControl *entity);
+ void UIControl_MatchMenuTag(const char *text);
+ void UIControl_HandleMenuChange(String *newMenuTag);
++#ifdef PS2_PORT
++void UIControl_PS2Layout(EntityUIControl *control);
++#endif
+ void UIControl_HandleMenuLoseFocus(EntityUIControl *parent);
+ void UIControl_ReturnToParentMenu(void);
+ 
+diff --git a/SonicMania/Objects/Menu/UIDialog.c b/SonicMania/Objects/Menu/UIDialog.c
+index 563b07c6..d25e199a 100644
+--- a/SonicMania/Objects/Menu/UIDialog.c
++++ b/SonicMania/Objects/Menu/UIDialog.c
+@@ -54,6 +54,14 @@ void UIDialog_Draw(void)
+         default: break;
+     }
+ 
++#ifdef PS2_PORT
++    if (ScreenInfo->size.x < WIDE_SCR_XSIZE) {
++        // re-wrapped text (see UIDialog_SetupText): the block of lines, each one 18 pixels left of the one above, is centred on the dialog
++        drawPos.x = self->position.x + ((9 * self->lineCount + 8) << 16);
++        drawPos.y = self->position.y - (0x200000 + 0x80000 * self->lineCount);
++    }
++#endif
++
+     drawPos.x += self->dialogPos.x;
+     drawPos.y += self->dialogPos.y;
+ 
+@@ -148,8 +156,37 @@ void UIDialog_SetupText(EntityUIDialog *dialog, String *text)
+         }
+ 
+         RSDK.CopyString(&dialog->textInfo, text);
++#ifdef PS2_PORT
++        if (ScreenInfo->size.x < WIDE_SCR_XSIZE) {
++            // 4:3: the stock line breaks go away (the text is wrapped again below); a break is just a space
++            for (int32 i = 0; i < dialog->textInfo.length; ++i) {
++                if (dialog->textInfo.chars[i] == '\n')
++                    dialog->textInfo.chars[i] = ' ';
++            }
++        }
++#endif
+         RSDK.SetSpriteAnimation(UIWidgets->fontFrames, 0, &dialog->animator, true, 0);
+         RSDK.SetSpriteString(UIWidgets->fontFrames, 0, &dialog->textInfo);
++
++#ifdef PS2_PORT
++        // 4:3 (320 wide): the stock line breaks are made for 424 pixels and run off the screen, so the text is wrapped again to fit.
++        if (ScreenInfo->size.x < WIDE_SCR_XSIZE) {
++            const int32 maxWidth = 200;
++            dialog->lineCount    = 0;
++            int32 lineStart      = 0;
++            int32 lastBreak      = -1;
++            for (int32 i = 0; i < text->length; ++i) {
++                if (text->chars[i] == ' ' || text->chars[i] == '\n')
++                    lastBreak = i;
++                if (i > lineStart && lastBreak >= lineStart && dialog->lineCount < 5
++                    && RSDK.GetStringWidth(UIWidgets->fontFrames, 0, &dialog->textInfo, lineStart, i + 1, 0) > maxWidth) {
++                    dialog->lineLength[dialog->lineCount++] = lastBreak;
++                    lineStart                              = lastBreak + 1;
++                    lastBreak                              = -1;
++                }
++            }
++        }
++#endif
+     }
+ }
+ 
+diff --git a/SonicMania/Objects/Menu/UIDialog.h b/SonicMania/Objects/Menu/UIDialog.h
+index 7e2f925d..5b9efbec 100644
+--- a/SonicMania/Objects/Menu/UIDialog.h
++++ b/SonicMania/Objects/Menu/UIDialog.h
+@@ -40,7 +40,7 @@ struct EntityUIDialog {
+     StateMachine(closeCB);
+     bool32 playEventSfx;
+     bool32 useAltColor;
+-    int32 lineLength[3];
++    int32 lineLength[5]; // end index of each line but the last (PS2: up to 6 lines when the text is re-wrapped for 4:3)
+     int32 lineCount;
+     Animator animator;
+ };
+diff --git a/SonicMania/Objects/Menu/UIResPicker.c b/SonicMania/Objects/Menu/UIResPicker.c
+index b298a276..17c6821d 100644
+--- a/SonicMania/Objects/Menu/UIResPicker.c
++++ b/SonicMania/Objects/Menu/UIResPicker.c
+@@ -123,8 +123,26 @@ void UIResPicker_Create(void *data)
+ 
+ void UIResPicker_StageLoad(void) { UIResPicker->aniFrames = RSDK.LoadSpriteAnimation("UI/SaveSelect.bin", SCOPE_STAGE); }
+ 
++#ifdef PS2_PORT
++// On the PS2 this picker (the PC "Fullscreen Resolution" row, which has no meaning here) selects where saves are stored: HOST (development),
++// MEMORY CARD or USB. The device numbers match PS2_SAVE_* in RSDK/PS2/ps2_hal.h; the functions live in the engine and are linked statically.
++extern int ps2_save_device(void);
++extern void ps2_save_set_device(int device);
++extern int ps2_save_device_available(int device);
++
++static const char *ps2SaveDeviceNames[3] = { "HOST (DEV)", "MEMORY CARD", "USB" };
++#endif
++
+ void UIResPicker_GetDisplayInfo(EntityUIResPicker *entity)
+ {
++#ifdef PS2_PORT
++    if (entity->selection < 0 || entity->selection > 2)
++        entity->selection = ps2_save_device(); // first update after creation (selection starts at -2), or out of range
++
++    RSDK.SetString(&entity->text, ps2SaveDeviceNames[entity->selection]);
++    RSDK.SetSpriteString(UIWidgets->fontFrames, 0, &entity->text);
++    return;
++#endif
+     if (sku_platform == PLATFORM_PC || sku_platform == PLATFORM_DEV) {
+         char buffer[0x40];
+         RSDK.GetDisplayInfo(&entity->selection, &entity->displayWidth, &entity->displayHeight, &entity->displayRefreshRate, buffer);
+@@ -169,6 +187,38 @@ void UIResPicker_ProcessButtonCB(void)
+ {
+     RSDK_THIS(UIResPicker);
+ 
++#ifdef PS2_PORT
++    {
++        // Left / right moves through the save devices, stopping at the ends. A device that cannot store saves right now is skipped over.
++        const int32 current = ps2_save_device();
++        int32 next          = current;
++        if (UIControl->anyLeftPress && current > 0)
++            next = current - 1;
++        if (UIControl->anyRightPress && current < 2)
++            next = current + 1;
++
++        if (next != current && ps2_save_device_available(next)) {
++            ps2_save_set_device(next);
++            self->selection = next;
++            UIResPicker_GetDisplayInfo(self);
++            self->prevSelection = self->selection;
++
++            RSDK.PlaySfx(UIWidgets->sfxBleep, false, 255);
++            self->textBounceVelocity   = -0x20000;
++            self->buttonBounceVelocity = -0x20000;
++            self->textBounceOffset     = 0;
++            self->buttonBounceOffset   = -0x20000;
++
++            Options->changed = true; // written to Settings.ini when the menu is left
++            LogHelpers_Print("PS2 save device -> %d", next);
++        }
++        else if (next != current) {
++            RSDK.PlaySfx(UIWidgets->sfxFail, false, 255);
++        }
++        return;
++    }
++#endif
++
+     int32 selection = self->selection;
+ 
+     if (UIControl->anyLeftPress)
+diff --git a/SonicMania/Objects/Menu/UIWinSize.c b/SonicMania/Objects/Menu/UIWinSize.c
+index e236db66..e87baf8f 100644
+--- a/SonicMania/Objects/Menu/UIWinSize.c
++++ b/SonicMania/Objects/Menu/UIWinSize.c
+@@ -10,6 +10,15 @@
+ #if GAME_VERSION != VER_100
+ ObjectUIWinSize *UIWinSize;
+ 
++#ifdef PS2_PORT
++// On the PS2 this picker (the PC "Screen Dimensions" row, which has no meaning here) is the DATA STREAM option: AUTO, ON (music and assets are read from
++// the medium while playing) or OFF (the level's music is loaded into memory before the level is shown and LOADING is displayed). The mode numbers
++// match ps2_stream_mode() in RSDK/PS2/ps2_hal.h; the functions live in the engine and are linked statically.
++extern int ps2_stream_mode(void);
++extern void ps2_set_stream_mode(int mode);
++static const char *ps2StreamNames[3] = { "AUTO", "ON", "OFF" };
++#endif
++
+ void UIWinSize_Update(void)
+ {
+     RSDK_THIS(UIWinSize);
+@@ -105,7 +114,12 @@ void UIWinSize_Create(void *data)
+         self->updateRange.x = 0x800000;
+         self->updateRange.y = 0x400000;
+ 
++#ifdef PS2_PORT
++        self->selection     = ps2_stream_mode();
++        self->prevSelection = -1; // so that the first update builds the text
++#else
+         self->selection  = RSDK.GetVideoSetting(VIDEOSETTING_WINDOW_HEIGHT) / SCREEN_YSIZE;
++#endif
+         self->bgEdgeSize = self->size.y >> 16;
+         self->size.y     = abs(self->size.y);
+ 
+@@ -126,6 +140,17 @@ void UIWinSize_SetupText(EntityUIWinSize *entityPtr)
+ {
+     RSDK_THIS(UIWinSize);
+ 
++#ifdef PS2_PORT
++    {
++        int32 mode = entityPtr->selection;
++        if (mode < 0 || mode > 2)
++            mode = ps2_stream_mode();
++        RSDK.SetString(&entityPtr->text, ps2StreamNames[mode]);
++        RSDK.SetSpriteString(UIWidgets->fontFrames, 0, &entityPtr->text);
++        return;
++    }
++#endif
++
+     if (sku_platform == PLATFORM_PC || sku_platform == PLATFORM_DEV) {
+         int32 height = 0;
+         RSDK.GetWindowSize(NULL, &height);
+@@ -181,6 +206,32 @@ void UIWinSize_ProcessButtonCB(void)
+ {
+     RSDK_THIS(UIWinSize);
+ 
++#ifdef PS2_PORT
++    {
++        // Left / right moves through AUTO - ON - OFF and stops at the ends.
++        const int32 current = ps2_stream_mode();
++        int32 next          = current;
++        if (UIControl->anyLeftPress && current > 0)
++            next = current - 1;
++        if (UIControl->anyRightPress && current < 2)
++            next = current + 1;
++
++        if (next != current) {
++            ps2_set_stream_mode(next);
++            self->selection     = next;
++            self->prevSelection = -1; // rebuild the text
++            RSDK.PlaySfx(UIWidgets->sfxBleep, false, 255);
++            self->textBounceVelocity   = -0x20000;
++            self->buttonBounceVelocity = -0x20000;
++            self->textBounceOffset     = 0;
++            self->buttonBounceOffset   = -0x20000;
++            Options->changed = true; // written to Settings.ini when the menu is left
++            LogHelpers_Print("PS2 data stream -> %d", next);
++        }
++        return;
++    }
++#endif
++
+     int32 selection = self->selection;
+ 
+     if (UIControl->anyLeftPress)
+diff --git a/SonicMania/Objects/Title/TitleSetup.c b/SonicMania/Objects/Title/TitleSetup.c
+index 300546db..fddbc4f8 100644
+--- a/SonicMania/Objects/Title/TitleSetup.c
++++ b/SonicMania/Objects/Title/TitleSetup.c
+@@ -314,6 +314,15 @@ void TitleSetup_State_WaitForEnter(void)
+     bool32 anyButton = ControllerInfo->keyA.press || ControllerInfo->keyB.press || ControllerInfo->keyC.press || ControllerInfo->keyX.press
+                        || ControllerInfo->keyY.press || ControllerInfo->keyZ.press || ControllerInfo->keyStart.press
+                        || ControllerInfo->keySelect.press;
++#ifdef PS2_PORT
++    {
++        // developer flag (boot.txt "menu=..."): leave the title screen by itself so scripted screenshot runs do not depend on button timing
++        extern const char *ps2_open_menu(void);
++        static int32 ps2TitleFrames = 0;
++        if (ps2_open_menu() && ++ps2TitleFrames > 240)
++            anyButton = true;
++    }
++#endif
+ 
+     bool32 anyClick = (!TouchInfo->count && self->touched) || Unknown_anyKeyPress;
+     self->touched   = TouchInfo->count > 0;
+diff --git a/SonicMania/Objects/UFO/UFO_Circuit.c b/SonicMania/Objects/UFO/UFO_Circuit.c
+index 74e3ca3e..43ad33cb 100644
+--- a/SonicMania/Objects/UFO/UFO_Circuit.c
++++ b/SonicMania/Objects/UFO/UFO_Circuit.c
+@@ -61,7 +61,15 @@ void UFO_Circuit_Draw(void)
+         RSDK.AddMeshFrameTo3DScene(UFO_Circuit->emeraldModel, UFO_Circuit->sceneIndex, &self->ufoAnimator, S3D_SOLIDCOLOR_SHADED_BLENDED_SCREEN,
+                                    &self->matWorld, &self->matNormal, 0xFFFFFF);
+ 
++#ifdef PS2_PORT
++        // PS2: the UFO is the goal of the stage and small on screen; the adaptive 3D detail (faces under a few pixels are dropped) would remove it.
++        extern void ps2_s3d_hold_detail(int on);
++        ps2_s3d_hold_detail(1);
++#endif
+         RSDK.Draw3DScene(UFO_Circuit->sceneIndex);
++#ifdef PS2_PORT
++        ps2_s3d_hold_detail(0);
++#endif
+     }
+ }
+ 
+diff --git a/SonicMania/Objects/UFO/UFO_Decoration.c b/SonicMania/Objects/UFO/UFO_Decoration.c
+index 6c61a004..91f93f46 100644
+--- a/SonicMania/Objects/UFO/UFO_Decoration.c
++++ b/SonicMania/Objects/UFO/UFO_Decoration.c
+@@ -52,7 +52,17 @@ void UFO_Decoration_Draw(void)
+ {
+     RSDK_THIS(UFO_Decoration);
+ 
++#ifdef PS2_PORT
++    // PS2: decorations (trees, flowers, pillars, birds) are scenery only. When the engine has had to drop 3D detail to hold the frame rate, the far ones
++    // are not drawn at all: each costs a scene set-up, a matrix chain, a mesh transform and its faces (about 0.7 ms each, a third of a heavy frame).
++    // Depths seen in UFO1 run from 0x4000 (at the camera) to about 0x4A000 (where they pop in); detail level 0-2 draws everything.
++    extern int ps2_s3d_level(void);
++    const int32 ps2Level  = ps2_s3d_level();
++    const int32 ps2Cutoff = ps2Level < 3 ? 0x7FFFFFFF : 0x4A000 - (ps2Level - 2) * 0xA000; // level 3: 0x40000 ... level 6: 0x22000
++    if (self->zdepth >= 0x4000 && self->zdepth < ps2Cutoff) {
++#else
+     if (self->zdepth >= 0x4000) {
++#endif
+         RSDK.Prepare3DScene(UFO_Decoration->sceneIndex);
+ 
+         RSDK.MatrixScaleXYZ(&self->matTransform, self->scale.x, self->size, self->scale.x);
