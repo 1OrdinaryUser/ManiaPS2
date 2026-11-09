@@ -3,20 +3,12 @@
 An unofficial, non-commercial port of the community **Sonic Mania Decompilation** to the PlayStation 2. This repository contains **no game data and no SEGA code**.
 You build the port yourself, on your own PC, from the game file of **your own legally obtained copy of Sonic Mania Plus**.
 
-> **You need to own Sonic Mania Plus.** Without the game's `Data.rsdk` nothing here runs, and this project cannot and will not provide it.
-> Buy it: [Steam](https://store.steampowered.com/app/584400/Sonic_Mania/), Epic Games Store, or a console store. Do not use this project to pirate the game.
->
-> **Never upload, share or sell the files you build** (the `.elf`, the `output` folder, any disc image): they contain SEGA's game data and a build of SEGA's game code.
-> This project is free, non-commercial, and not affiliated with or endorsed by SEGA, Headcannon or Evening Star. "Sonic" and "Sonic Mania" are SEGA trademarks.
-
+> **You need to own Sonic Mania Plus.**  `Data.rsdk` 
+> Buy it: [Steam](https://store.steampowered.com/app/584400/Sonic_Mania/)
+> 
 ## Status
 
-A working prototype, tested **only in the PCSX2 emulator**. It has never been run on a real PlayStation 2, so real-console speed, USB loading and video output are unverified.
-
-- In PCSX2 most acts run at a steady 60 FPS. A few heavy acts do not: Press Garden 1 and Titanic Monarch 3 hold 60 FPS on roughly 60-70% of frames, Chemical Plant 2 about 80%.
-  Most of the cost is decoding the music in software. Special stages lower their 3D detail when the frame rate drops.
-- Not implemented: split-screen (Competition mode), video playback (the "bad ending" movies), online features.
-- See [docs/PORT_NOTES.md](docs/PORT_NOTES.md) for the full list.
+Tested on a real PS2 (PAL 50Hz Italian)
 
 ## What you need
 
@@ -30,8 +22,7 @@ A working prototype, tested **only in the PCSX2 emulator**. It has never been ru
 ## Build
 
 1. Copy `Data.rsdk` from your Sonic Mania Plus folder (next to `SonicMania.exe`) into the **`input`** folder of this repository.
-2. Double-click **`build.bat`** (or run it from a terminal). It checks your file, builds, and leaves the result in **`output\ManiaPS2`**.
-3. The build takes several minutes. If something is wrong the message tells you what to fix.
+2. Double-click **`build.bat`** (or run it from a terminal). 
 
 `output\ManiaPS2` contains **`SLUS_999.01.SonicManiaPS2.iso`**, a PlayStation 2 disc image (about 215 MB) holding the game and your `Data.rsdk`, and a short `README.txt`.
 
@@ -40,20 +31,16 @@ Options for `build.ps1` (run `powershell -File build.ps1`): `-Refetch` downloads
 
 ## Run it
 
-**On a PlayStation 2 (untested on real hardware):** the console needs a way to run game images, for example Free McBoot or a softmod with Open PS2 Loader (OPL). Put `SLUS_999.01.SonicManiaPS2.iso`
+**On a PlayStation 2:** the console needs a way to run game images, for example Free McBoot or a softmod with Open PS2 Loader (OPL). Put `SLUS_999.01.SonicManiaPS2.iso`
 where OPL looks for images (the `CD` folder of a USB stick, a network share or the hard disk; the image is smaller than a CD, so OPL lists it under CD) and start it from OPL.
 The disc image contains `SYSTEM.CNF`, the game (`SLUS_999.01`, a plain ELF) and `DATA.RSDK`. The game reads its data from the disc; **Settings.ini, log.txt and your saves are written
 to the memory card in slot 1** (folder `SONICMANIAPS2`; the game never formats a card). With no memory card they go to a USB stick if one is plugged in.
 `log.txt` is the file to send along with a bug report: on the disc build it is the only record of what the game did. To keep the game fast, `log.txt` is written only at the end of a scene load (at most every 15 s, up to 32 KB) and when the game crashes; it holds the start-up and audio lines, not the per-frame details.
 
-**Report screen (no files needed):** while playing, hold **R1 + L2 + SELECT** together for half a second. The game stops on a blue text screen showing how long each scene load took, how much of that was file reading and log writing, and the last log lines. Photograph it and restart the console. It also works while a scene is loading (it checks the pad between files), so it can show where a long load is stuck: the screen lists the last file opened. Hold the three buttons for half a second.
+**Report screen:** while playing, hold **R1 + L2 + SELECT** together for half a second. The game stops on a blue text screen showing how long each scene load took, how much of that was file reading and log writing, and the last log lines. Photograph it and restart the console. It also works while a scene is loading (it checks the pad between files), so it can show where a long load is stuck: the screen lists the last file opened. Hold the three buttons for half a second.
 
 **In PCSX2:** File > Start File, choose `SLUS_999.01.SonicManiaPS2.iso` (or `pcsx2-qt -batch -- SLUS_999.01.SonicManiaPS2.iso`). PCSX2 needs a memory card in slot 1.
 `tools\pcsx2_smoke.ps1 -Pcsx2 <path to pcsx2-qt.exe>` checks the ISO and boots a test copy of it to the Main Menu.
-
-**From a USB stick as a plain ELF (older way):** build with `-KeepElf`, copy the `ManiaPS2` folder (ELF and `Data.rsdk` side by side) to a FAT32 stick and start `SonicManiaPS2.elf` with a homebrew
-launcher such as uLaunchELF. Settings, log and saves then stay in that folder.
-## If the screen stays black or the game stops
 
 The game puts a **boot console** on the screen from the first moment: a blue text screen that lists the start-up steps (the version it was built, the console's TV standard, the disc or USB it started from, the memory card, the sound modules, the video mode) while the game loads. It stays until the first game picture appears. You should see it on any TV and cable.
 
@@ -64,8 +51,8 @@ The game puts a **boot console** on the screen from the first moment: a blue tex
 - **No text at all, not even blue:** the game did not start (or the console did not run the disc image). Check that the image runs in OPL or PCSX2 and that the console's own region and video settings are correct.
 ## Settings and saves
 
-- **Options > Video:** Resolution *240P* (a real 240-line picture, 60 Hz NTSC / 50 Hz PAL, no interlace: sharp scanline look on a CRT, works on every cable, SCART and composite included; Scan mode does not apply) or *480P* (480 lines, interlaced or progressive, see Scan mode); Aspect *4:3* (320x240) or *16:9* (424x240); Letterbox; Filter; Scan mode (480i or
-  480p, 480P only); **Save Device**. The default is 480i (interlaced, works on every cable), 4:3. Progressive scan needs component cables. Menus lay themselves out for the chosen aspect.
+- **Options > Video:** Resolution *240P* (a real 240-line picture, 60 Hz NTSC / 50 Hz PAL, no interlace) or *480P* (480 lines, progressive, see Scan mode); Aspect *4:3* (320x240) or *16:9* (424x240); Letterbox; Filter; Scan mode (480i or
+  480p, 480 only); **Save Device**. The default is 480i (interlaced, works on every cable), 4:3. Progressive scan needs component cables. Menus lay themselves out for the chosen aspect.
 - **Save Device:** *Host* (the folder the game was started from; not offered when the game runs from the disc image, which is read-only, where the memory card is the default), *Memory Card* (slot 1, folder `SONICMANIAPS2`; the game never formats a card), or *USB*.
   Progress is not copied between devices.
 - **Data Stream** (Options > Video): *Auto* (default), *On* or *Off*. *On* reads music and assets from the disc image, USB stick or card while you play (the original behaviour). *Off* loads a level's music into memory **before** the level is shown, so nothing is read from the slow medium during play; a **LOADING...** indicator with a rolling Sonic ball appears in the bottom-right corner while a level loads. The level's own music and as many of the standard tracks as fit in memory are loaded; the rest keep streaming. *Auto* turns this on when the game was started from a USB stick, or when a speed test of `Data.rsdk` at start-up measures under 2.5 MB/s (a PS2 reading an image from a USB 1.1 stick manages about 0.5 MB/s), and leaves it off otherwise. The result of the test is in the log (`[boot] media speed`).- **4:3 screens:** to keep the banners readable only the triangle prompt (for example "Game Opts.") is shown, in the bottom-right corner; Back, Confirm and Delete are not drawn.
