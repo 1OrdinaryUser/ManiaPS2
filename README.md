@@ -1,4 +1,5 @@
-<img width="1600" height="1289" alt="immagine" src="https://github.com/user-attachments/assets/8e32d051-6d31-4d32-a02a-1ea9da23195e" />
+<img width="800" height="644" alt="immagine" src="https://github.com/user-attachments/assets/8e32d051-6d31-4d32-a02a-1ea9da23195e" />
+
 # Sonic Mania for PlayStation 2 (unofficial port)
 
 An unofficial, non-commercial port of the community **Sonic Mania Decompilation** to the PlayStation 2. This repository contains **no game data and no SEGA code**.
